@@ -1,0 +1,1 @@
+'graph TD\n A[User Logs In] --> B[Workspace Loads]\n B --> C[Real-Time Code Editor]\n C --> D[AI Code Suggestions]\n D --> E[Version Control Integration]\n E --> F[Team Collaboration Tools]\n F --> G[Save and Sync Changes]\n G --> H[Project Dashboard]'
