@@ -81,9 +81,23 @@ N8N_WEBHOOK_URL = os.getenv('N8N_WEBHOOK_URL', 'http://localhost:5678/webhook/id
 N8N_CHAT_WEBHOOK_URL = os.getenv('N8N_CHAT_WEBHOOK_URL', 'http://localhost:5678/webhook/chat-message')
 BACKEND_BASE_URL = os.getenv('BACKEND_BASE_URL', 'http://localhost:5000').rstrip('/')
 
+def init_db():
+    """Create tables, retrying up to 5 times with back-off to survive slow cold starts."""
+    import time as _time
+    for attempt in range(1, 6):
+        try:
+            db.create_all()
+            test_db_connection()
+            print("Database initialized OK")
+            return
+        except Exception as e:
+            print(f"DB init attempt {attempt}/5 failed: {e}")
+            if attempt < 5:
+                _time.sleep(attempt * 3)  # 3s, 6s, 9s, 12s
+    print("WARNING: DB init failed after 5 attempts. Tables will be created on first request.")
+
 with app.app_context():
-    db.create_all()
-    test_db_connection()
+    init_db()
 
 def background_retry_job(app):
     """
