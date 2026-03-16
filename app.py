@@ -99,6 +99,18 @@ def init_db():
 with app.app_context():
     init_db()
 
+@app.route('/', methods=['GET'])
+def root_status():
+    return jsonify({
+        "service": "idea-incubator-backend",
+        "status": "ok",
+        "docs_hint": "Use /api/catalogs/ or /api/ideas/submit"
+    }), 200
+
+@app.route('/healthz', methods=['GET'])
+def healthz():
+    return jsonify({"status": "ok"}), 200
+
 def background_retry_job(app):
     """
     Background job that periodically checks for pending entries
