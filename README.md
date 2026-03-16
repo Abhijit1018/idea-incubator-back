@@ -84,3 +84,5 @@ docker run --env-file .env -p 5000:5000 idea-incubator-backend
 - Set `BACKEND_BASE_URL` to your public backend URL so uploaded image URLs are correct.
 - Ensure n8n can call `POST /api/webhooks/n8n-callback`.
 - For persistent uploads, mount `static/uploads` to durable storage.
+- On Render free/starter instances, set `ENABLE_VECTOR_SEARCH=false` to avoid loading large embedding models.
+- Keep `WEB_CONCURRENCY=1` on small instances.

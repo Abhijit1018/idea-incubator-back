@@ -11,23 +11,34 @@ from dotenv import load_dotenv
 import threading
 import time
 from datetime import timedelta
-from pinecone import Pinecone, ServerlessSpec
-from sentence_transformers import SentenceTransformer
+
+try:
+    from pinecone import Pinecone, ServerlessSpec
+except Exception:
+    Pinecone = None
+    ServerlessSpec = None
+
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    SentenceTransformer = None
 
 load_dotenv()
 
-# Vector services are optional in local/dev environments.
+# Vector services are optional. Keep disabled on small instances by default.
 embedding_model = None
 pc = None
 index = None
+ENABLE_VECTOR_SEARCH = os.getenv('ENABLE_VECTOR_SEARCH', 'false').lower() == 'true'
 
-try:
-    embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-except Exception as e:
-    print(f"Embedding model initialization failed: {e}")
+if ENABLE_VECTOR_SEARCH and SentenceTransformer:
+    try:
+        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+    except Exception as e:
+        print(f"Embedding model initialization failed: {e}")
 
 pinecone_api_key = os.getenv('PINECONE_API_KEY')
-if pinecone_api_key:
+if ENABLE_VECTOR_SEARCH and pinecone_api_key and Pinecone and ServerlessSpec:
     try:
         pc = Pinecone(api_key=pinecone_api_key)
         index_name = os.getenv('PINECONE_INDEX_NAME', 'mindinspo-catalogs')
@@ -431,8 +442,8 @@ def generate_catalog_embedding(entry_id):
         if not text_for_embedding:
             return jsonify({"error": "No content available for embedding"}), 400
         
-        if not embedding_model:
-            return jsonify({"error": "Embedding model is not available on this server"}), 503
+        if not ENABLE_VECTOR_SEARCH or not embedding_model:
+            return jsonify({"error": "Embedding feature is disabled on this server"}), 503
 
         # Generate embedding using SentenceTransformer
         try:
@@ -497,8 +508,37 @@ def search_catalogs():
         if not query_text:
             return jsonify({"error": "query is required"}), 400
         
-        if not embedding_model:
-            return jsonify({"error": "Search embeddings are not available on this server"}), 503
+        if not ENABLE_VECTOR_SEARCH or not embedding_model:
+            entries = CatalogEntry.query.filter(
+                db.or_(
+                    CatalogEntry.raw_input.ilike(f'%{query_text}%'),
+                    CatalogEntry.summary.ilike(f'%{query_text}%'),
+                    CatalogEntry.tech_stack.cast(db.String).ilike(f'%{query_text}%'),
+                    CatalogEntry.creator.ilike(f'%{query_text}%')
+                )
+            ).limit(limit).all()
+
+            result = []
+            for entry in entries:
+                result.append({
+                    "id": entry.id,
+                    "raw_input": entry.raw_input,
+                    "input_type": entry.input_type,
+                    "status": entry.status,
+                    "summary": entry.summary,
+                    "tech_stack": entry.tech_stack,
+                    "pros_cons": entry.pros_cons,
+                    "similar_tools": entry.similar_tools,
+                    "creator": entry.creator,
+                    "link": entry.link,
+                    "installation": entry.installation,
+                    "unique_features": entry.unique_features,
+                    "market_trend": entry.market_trend,
+                    "mermaid_syntax": entry.mermaid_syntax,
+                    "image_url": entry.image_url,
+                    "created_at": entry.created_at.isoformat(),
+                })
+            return jsonify(result), 200
 
         # Generate embedding for query text using SentenceTransformer
         try:
