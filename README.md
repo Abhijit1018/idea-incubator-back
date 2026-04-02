@@ -58,6 +58,7 @@ See `.env.example` for all options. Key variables:
 
 - `DATABASE_URL`
 - `BACKEND_BASE_URL`
+- `CORS_ALLOWED_ORIGINS`
 - `N8N_WEBHOOK_URL`
 - `N8N_CHAT_WEBHOOK_URL`
 - `PINECONE_API_KEY` (optional)
@@ -81,7 +82,8 @@ docker run --env-file .env -p 5000:5000 idea-incubator-backend
 ## Production Notes
 
 - Use PostgreSQL via `DATABASE_URL`.
-- Set `BACKEND_BASE_URL` to your public backend URL so uploaded image URLs are correct.
+- Set `BACKEND_BASE_URL` to your public backend URL so uploaded image URLs are correct. If omitted, backend derives it from incoming request host.
+- Set `CORS_ALLOWED_ORIGINS` to your Netlify domain (comma-separated for multiple domains).
 - Ensure n8n can call `POST /api/webhooks/n8n-callback`.
 - For persistent uploads, mount `static/uploads` to durable storage.
 - On Render free/starter instances, set `ENABLE_VECTOR_SEARCH=false` to avoid loading large embedding models.

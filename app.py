@@ -7,6 +7,7 @@ import uuid
 import requests
 import json
 from werkzeug.utils import secure_filename
+from werkzeug.middleware.proxy_fix import ProxyFix
 from dotenv import load_dotenv
 import threading
 import time
@@ -57,10 +58,28 @@ if ENABLE_VECTOR_SEARCH and pinecone_api_key and Pinecone and ServerlessSpec:
         print(f"Pinecone initialization failed: {e}")
 
 app = Flask(__name__)
-CORS(app)
+
+
+def normalize_database_url(database_url):
+    if database_url.startswith('postgres://'):
+        return database_url.replace('postgres://', 'postgresql://', 1)
+    return database_url
+
+
+cors_origins_raw = os.getenv('CORS_ALLOWED_ORIGINS', '').strip()
+if cors_origins_raw:
+    cors_origins = [origin.strip() for origin in cors_origins_raw.split(',') if origin.strip()]
+    CORS(app, resources={r"/api/*": {"origins": cors_origins}})
+else:
+    CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+# Respect X-Forwarded-* headers from Render/Netlify proxies.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 # Use SQLite for local development ease, but can switch to Postgres via DATABASE_URL
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///incubator.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = normalize_database_url(
+    os.getenv('DATABASE_URL', 'sqlite:///incubator.db')
+)
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'pool_pre_ping': True,
@@ -79,7 +98,13 @@ def test_db_connection():
 
 N8N_WEBHOOK_URL = os.getenv('N8N_WEBHOOK_URL', 'http://localhost:5678/webhook/idea-incubator')
 N8N_CHAT_WEBHOOK_URL = os.getenv('N8N_CHAT_WEBHOOK_URL', 'http://localhost:5678/webhook/chat-message')
-BACKEND_BASE_URL = os.getenv('BACKEND_BASE_URL', 'http://localhost:5000').rstrip('/')
+BACKEND_BASE_URL = os.getenv('BACKEND_BASE_URL', '').rstrip('/')
+
+
+def get_public_backend_base_url():
+    if BACKEND_BASE_URL:
+        return BACKEND_BASE_URL
+    return request.host_url.rstrip('/')
 
 def init_db():
     """Create tables, retrying up to 5 times with back-off to survive slow cold starts."""
@@ -280,7 +305,7 @@ def n8n_callback():
             image_file.save(file_path)
             
             # Construct the absolute URL for the frontend
-            image_url = f"{BACKEND_BASE_URL}/static/uploads/{unique_filename}"
+            image_url = f"{get_public_backend_base_url()}/static/uploads/{unique_filename}"
 
         # 5. Placeholder comment for database update logic
         # TODO: Add your SQLAlchemy (or standard SQL) database update logic using the entry_id here
@@ -781,4 +806,10 @@ retry_thread = threading.Thread(target=background_retry_job, args=(app,), daemon
 retry_thread.start()
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000, use_reloader=False) # disabled reloader to prevent duplicate threads
+    is_debug = os.getenv('FLASK_ENV', 'development').lower() == 'development'
+    app.run(
+        host='0.0.0.0',
+        port=int(os.getenv('PORT', '5000')),
+        debug=is_debug,
+        use_reloader=False,
+    )
