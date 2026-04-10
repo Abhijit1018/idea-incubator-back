@@ -294,18 +294,37 @@ def n8n_callback():
         image_file = request.files.get('image_file')
         image_url = None
 
-        # 4. Secure the filename and save to static/uploads
+        # 4. Upload to ImgBB (or fallback to local if it fails)
         if image_file and image_file.filename != '':
-            uploads_dir = os.path.join(app.root_path, 'static', 'uploads')
-            os.makedirs(uploads_dir, exist_ok=True)
-            
             filename = secure_filename(image_file.filename)
             unique_filename = f"{uuid.uuid4().hex}_{filename}"
-            file_path = os.path.join(uploads_dir, unique_filename)
-            image_file.save(file_path)
             
-            # Construct the absolute URL for the frontend
-            image_url = f"{get_public_backend_base_url()}/static/uploads/{unique_filename}"
+            import base64
+            IMGBB_API_KEY = os.getenv('IMGBB_API_KEY', 'cc532d52d3ec271f34a5dd8227db219a')
+            
+            try:
+                image_content = image_file.read()
+                b64_image = base64.b64encode(image_content).decode('utf-8')
+                
+                imgbb_res = requests.post(
+                    "https://api.imgbb.com/1/upload",
+                    data={"key": IMGBB_API_KEY, "image": b64_image, "name": filename},
+                    timeout=20.0
+                )
+                
+                if imgbb_res.status_code == 200:
+                    image_url = imgbb_res.json()['data']['url']
+                    print(f"Image uploaded to ImgBB successfully: {image_url}")
+                else:
+                    raise Exception(f"ImgBB returned {imgbb_res.status_code}: {imgbb_res.text}")
+            except Exception as e:
+                print(f"ImgBB upload failed, falling back to local storage: {e}")
+                uploads_dir = os.path.join(app.root_path, 'static', 'uploads')
+                os.makedirs(uploads_dir, exist_ok=True)
+                file_path = os.path.join(uploads_dir, unique_filename)
+                image_file.seek(0)
+                image_file.save(file_path)
+                image_url = f"{get_public_backend_base_url()}/static/uploads/{unique_filename}"
 
         # 5. Placeholder comment for database update logic
         # TODO: Add your SQLAlchemy (or standard SQL) database update logic using the entry_id here
