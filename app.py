@@ -147,21 +147,6 @@ def init_db():
             print(f"DB init attempt {attempt}/5 failed: {e}", file=sys.stderr); sys.stderr.flush()
             _time.sleep(2)
 
-# Ensure tables are created when running in production (Gunicorn)
-print("Entering app_context block for startup...", file=sys.stderr)
-with app.app_context():
-    try:
-        print("Initializing database...", file=sys.stderr)
-        init_db()
-        
-        # Start background thread
-        print("Starting background retry thread...", file=sys.stderr)
-        retry_thread = threading.Thread(target=background_retry_job, args=(app,), daemon=True)
-        retry_thread.start()
-        
-        print("Startup sequence complete", file=sys.stderr)
-    except Exception as e:
-        print(f"Startup sequence failed: {e}", file=sys.stderr)
 
 # Test database connection
 def test_db_connection():
@@ -2248,19 +2233,24 @@ def mark_notifications_read():
         return jsonify({"error": str(e)}), 500
 
 
-
+# Production Startup Sequence (runs during Gunicorn import)
+print("Entering app_context block for startup...", file=sys.stderr)
+with app.app_context():
+    try:
+        print("Initializing database...", file=sys.stderr)
+        init_db()
+        
+        # Start background thread
+        print("Starting background retry thread...", file=sys.stderr)
+        retry_thread = threading.Thread(target=background_retry_job, args=(app,), daemon=True)
+        retry_thread.start()
+        
+        print("Startup sequence complete", file=sys.stderr)
+    except Exception as e:
+        print(f"Startup sequence failed: {e}", file=sys.stderr)
 
 
 if __name__ == '__main__':
-    print("before app_context", file=sys.stderr); sys.stderr.flush()
-    with app.app_context():
-        init_db()
-    print("after app_context", file=sys.stderr); sys.stderr.flush()
-
-    # Start background thread
-    retry_thread = threading.Thread(target=background_retry_job, args=(app,), daemon=True)
-    retry_thread.start()
-
     is_debug = os.getenv('FLASK_ENV', 'development').lower() == 'development'
     app.run(
         host='0.0.0.0',
