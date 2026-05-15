@@ -130,22 +130,30 @@ db.init_app(app)
 print("after db.init_app", file=sys.stderr); sys.stderr.flush()
 
 # Ensure tables are created when running in production (Gunicorn)
-# For larger apps, use migrations. For this MVP, create_all is fine.
+print("Entering app_context block for startup...", file=sys.stderr)
 with app.app_context():
     try:
         print("Initializing database...", file=sys.stderr)
         init_db()
-        print("Database initialized successfully", file=sys.stderr)
+        
+        # Start background thread
+        print("Starting background retry thread...", file=sys.stderr)
+        retry_thread = threading.Thread(target=background_retry_job, args=(app,), daemon=True)
+        retry_thread.start()
+        
+        print("Startup sequence complete", file=sys.stderr)
     except Exception as e:
-        print(f"Database initialization failed: {e}", file=sys.stderr)
+        print(f"Startup sequence failed: {e}", file=sys.stderr)
 
 # Test database connection
 def test_db_connection():
     try:
         db.session.execute(db.text('SELECT 1'))
-        print("Database connection OK")
+        print("Database connection OK", file=sys.stderr)
+        return True
     except Exception as e:
-        print(f"Database connection error: {e}")
+        print(f"Database connection error: {e}", file=sys.stderr)
+        return False
 
 N8N_WEBHOOK_URL = os.getenv('N8N_WEBHOOK_URL', 'http://localhost:5678/webhook/idea-incubator')
 N8N_CHAT_WEBHOOK_URL = os.getenv('N8N_CHAT_WEBHOOK_URL', 'http://localhost:5678/webhook/chat-message')
@@ -239,6 +247,14 @@ def get_public_backend_base_url():
     if BACKEND_BASE_URL:
         return BACKEND_BASE_URL
     return request.host_url.rstrip('/')
+
+@app.route('/')
+def health_check():
+    return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "service": "MindInspo Backend"
+    }), 200
 
 def init_db():
     """Create tables, retrying up to 5 times with back-off to survive slow cold starts."""
