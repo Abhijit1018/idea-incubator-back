@@ -129,6 +129,24 @@ print("before db.init_app", file=sys.stderr); sys.stderr.flush()
 db.init_app(app)
 print("after db.init_app", file=sys.stderr); sys.stderr.flush()
 
+def init_db():
+    """Create tables, retrying up to 5 times with back-off to survive slow cold starts."""
+    import time as _time
+    print("entering init_db", file=sys.stderr); sys.stderr.flush()
+    for attempt in range(1, 6):
+        try:
+            print(f"init_db attempt {attempt}", file=sys.stderr); sys.stderr.flush()
+            db.create_all()
+            print("create_all passed", file=sys.stderr); sys.stderr.flush()
+
+            print("running test_db_connection", file=sys.stderr); sys.stderr.flush()
+            test_db_connection()
+            print("Database initialized OK", file=sys.stderr); sys.stderr.flush()
+            return
+        except Exception as e:
+            print(f"DB init attempt {attempt}/5 failed: {e}", file=sys.stderr); sys.stderr.flush()
+            _time.sleep(2)
+
 # Ensure tables are created when running in production (Gunicorn)
 print("Entering app_context block for startup...", file=sys.stderr)
 with app.app_context():
@@ -249,40 +267,12 @@ def get_public_backend_base_url():
     return request.host_url.rstrip('/')
 
 @app.route('/')
-def health_check():
-    return jsonify({
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
-        "service": "MindInspo Backend"
-    }), 200
-
-def init_db():
-    """Create tables, retrying up to 5 times with back-off to survive slow cold starts."""
-    import time as _time
-    print("entering init_db", file=sys.stderr); sys.stderr.flush()
-    for attempt in range(1, 6):
-        try:
-            print(f"init_db attempt {attempt}", file=sys.stderr); sys.stderr.flush()
-            db.create_all()
-            print("create_all passed", file=sys.stderr); sys.stderr.flush()
-
-            print("running test_db_connection", file=sys.stderr); sys.stderr.flush()
-            test_db_connection()
-            print("Database initialized OK", file=sys.stderr); sys.stderr.flush()
-            return
-        except Exception as e:
-            print(f"DB init attempt {attempt}/5 failed: {e}", file=sys.stderr); sys.stderr.flush()
-            if attempt < 5:
-                _time.sleep(attempt * 3)  # 3s, 6s, 9s, 12s
-    print("WARNING: DB init failed after 5 attempts. Tables will be created on first request.", file=sys.stderr); sys.stderr.flush()
-
-
-@app.route('/', methods=['GET'])
 def root_status():
     return jsonify({
-        "service": "idea-incubator-backend",
-        "status": "ok",
-        "docs_hint": "Use /api/catalogs/ or /api/ideas/submit"
+        "service": "MindInspo Backend",
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "docs_hint": "Use /api/catalogs/ or /api/community/feed"
     }), 200
 
 @app.route('/healthz', methods=['GET'])

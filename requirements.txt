@@ -8,3 +8,4 @@ sentence-transformers==5.1.1
 numpy==2.3.3
 gunicorn==23.0.0
 psycopg2-binary==2.9.10
+cachetools==5.5.0
