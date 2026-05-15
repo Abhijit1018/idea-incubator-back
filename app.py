@@ -92,7 +92,7 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 print("after proxyfix", file=sys.stderr); sys.stderr.flush()
 
-# Use SQLite for local development ease, but can switch to Postgres via DATABASE_URL
+# Database Configuration
 db_uri = normalize_database_url(os.getenv('DATABASE_URL', 'sqlite:///incubator.db'))
 app.config['SQLALCHEMY_DATABASE_URI'] = db_uri
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -100,17 +100,18 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 engine_options = {
     'pool_pre_ping': True,
     'pool_recycle': 300,
-    'pool_size': 10,
-    'max_overflow': 20,
-    'connect_args': {
+}
+
+if db_uri.startswith('postgresql'):
+    print("Detected PostgreSQL - adding SSL and pool options", file=sys.stderr)
+    engine_options['pool_size'] = 10
+    engine_options['max_overflow'] = 20
+    engine_options['connect_args'] = {
         'connect_timeout': 15,
         'sslmode': 'require'
     }
-}
 
-
-# Force IPv4 to prevent connection fallback delays or issues with IPv6
-if db_uri.startswith('postgresql'):
+    # Force IPv4 to prevent connection fallback delays or issues with IPv6
     import socket
     from urllib.parse import urlparse
     try:
@@ -118,18 +119,25 @@ if db_uri.startswith('postgresql'):
         if parsed.hostname and not parsed.hostname.replace('.', '').isdigit():
             ipv4 = socket.gethostbyname(parsed.hostname)
             engine_options['connect_args']['host'] = ipv4
-            # We still need the original hostname for SSL certificate verification
-            # but psycopg2 usually handles this if we use 'host' and 'hostaddr' is not set, 
-            # or we can pass it in the connection string.
             print(f"Resolved DB host {parsed.hostname} to {ipv4} for stability", file=sys.stderr)
     except Exception as e:
         print(f"Failed to resolve DB host: {e}", file=sys.stderr)
 
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = engine_options
 
-print("before db init", file=sys.stderr); sys.stderr.flush()
+print("before db.init_app", file=sys.stderr); sys.stderr.flush()
 db.init_app(app)
-print("after db init", file=sys.stderr); sys.stderr.flush()
+print("after db.init_app", file=sys.stderr); sys.stderr.flush()
+
+# Ensure tables are created when running in production (Gunicorn)
+# For larger apps, use migrations. For this MVP, create_all is fine.
+with app.app_context():
+    try:
+        print("Initializing database...", file=sys.stderr)
+        init_db()
+        print("Database initialized successfully", file=sys.stderr)
+    except Exception as e:
+        print(f"Database initialization failed: {e}", file=sys.stderr)
 
 # Test database connection
 def test_db_connection():
