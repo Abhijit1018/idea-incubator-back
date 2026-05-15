@@ -43,6 +43,7 @@ class CatalogEntry(db.Model):
     published_at = db.Column(db.DateTime, nullable=True)
     view_count = db.Column(db.Integer, default=0)
     tags = db.Column(db.JSON, nullable=True)
+    visible_fields = db.Column(db.JSON, nullable=True)  # List of field names visible when published; null = show all
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -191,3 +192,15 @@ class IdeaUpdate(db.Model):
 
     catalog_entry = db.relationship('CatalogEntry', backref=db.backref('updates', lazy=True, order_by='IdeaUpdate.created_at.desc()'))
     user = db.relationship('User', backref=db.backref('idea_updates', lazy=True))
+
+
+class Collaborator(db.Model):
+    __tablename__ = 'collaborators'
+    user_id = db.Column(db.String(36), db.ForeignKey('users.id'), primary_key=True)
+    catalog_entry_id = db.Column(db.String(36), db.ForeignKey('catalog_entries.id'), primary_key=True)
+    role = db.Column(db.String(30), nullable=True)
+    joined_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    # Relationships
+    user = db.relationship('User', backref=db.backref('collaborations', lazy=True))
+    catalog_entry = db.relationship('CatalogEntry', backref=db.backref('collaborator_entries', lazy=True))

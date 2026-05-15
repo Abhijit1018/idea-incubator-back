@@ -1,32 +1,41 @@
+import sys
+print("STARTING APP.PY", file=sys.stderr)
+sys.stderr.flush()
 import os
+print("imported os", file=sys.stderr); sys.stderr.flush()
 import base64
+print("imported base64", file=sys.stderr); sys.stderr.flush()
 from functools import wraps
+print("imported wraps", file=sys.stderr); sys.stderr.flush()
 from flask import Flask, request, jsonify, g
+print("imported flask", file=sys.stderr); sys.stderr.flush()
 from flask_cors import CORS
-from models import db, User, CatalogEntry, ChatMessage, CatalogEmbedding, Comment, Like, Bookmark, Reaction, ConnectRequest, Notification, IdeaUpdate, REACTION_TYPES, CONNECT_ROLES
+print("imported flask_cors", file=sys.stderr); sys.stderr.flush()
+from models import db, User, CatalogEntry, ChatMessage, CatalogEmbedding, Comment, Like, Bookmark, Reaction, ConnectRequest, Notification, IdeaUpdate, Collaborator, REACTION_TYPES, CONNECT_ROLES
+print("imported models", file=sys.stderr); sys.stderr.flush()
 from datetime import datetime
+print("imported datetime", file=sys.stderr); sys.stderr.flush()
 import uuid
+print("imported uuid", file=sys.stderr); sys.stderr.flush()
 import requests as http_requests
+print("imported requests", file=sys.stderr); sys.stderr.flush()
 import json
+print("imported json", file=sys.stderr); sys.stderr.flush()
 from werkzeug.utils import secure_filename
+print("imported secure_filename", file=sys.stderr); sys.stderr.flush()
 from werkzeug.middleware.proxy_fix import ProxyFix
+print("imported ProxyFix", file=sys.stderr); sys.stderr.flush()
 from dotenv import load_dotenv
+print("imported load_dotenv", file=sys.stderr); sys.stderr.flush()
 import threading
 import time
 from datetime import timedelta
 
-try:
-    from pinecone import Pinecone, ServerlessSpec
-except Exception:
-    Pinecone = None
-    ServerlessSpec = None
-
-try:
-    from sentence_transformers import SentenceTransformer
-except Exception:
-    SentenceTransformer = None
-
+Pinecone = None
+ServerlessSpec = None
+print("before load_dotenv", file=sys.stderr); sys.stderr.flush()
 load_dotenv()
+print("after load_dotenv", file=sys.stderr); sys.stderr.flush()
 
 # Vector services are optional. Keep disabled on small instances by default.
 embedding_model = None
@@ -34,8 +43,9 @@ pc = None
 index = None
 ENABLE_VECTOR_SEARCH = os.getenv('ENABLE_VECTOR_SEARCH', 'false').lower() == 'true'
 
-if ENABLE_VECTOR_SEARCH and SentenceTransformer:
+if ENABLE_VECTOR_SEARCH:
     try:
+        from sentence_transformers import SentenceTransformer
         embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
     except Exception as e:
         print(f"Embedding model initialization failed: {e}")
@@ -59,36 +69,67 @@ if ENABLE_VECTOR_SEARCH and pinecone_api_key and Pinecone and ServerlessSpec:
     except Exception as e:
         print(f"Pinecone initialization failed: {e}")
 
+print("before flask app init", file=sys.stderr); sys.stderr.flush()
 app = Flask(__name__)
-
+print("after flask app init", file=sys.stderr); sys.stderr.flush()
 
 def normalize_database_url(database_url):
     if database_url.startswith('postgres://'):
         return database_url.replace('postgres://', 'postgresql://', 1)
     return database_url
 
-
 cors_origins_raw = os.getenv('CORS_ALLOWED_ORIGINS', '').strip()
 if cors_origins_raw:
     cors_origins = [origin.strip() for origin in cors_origins_raw.split(',') if origin.strip()]
-    CORS(app, resources={r"/api/*": {"origins": cors_origins}})
+    CORS(app, resources={r"/api/*": {"origins": cors_origins, "allow_headers": ["Authorization", "Content-Type"]}})
 else:
-    CORS(app, resources={r"/api/*": {"origins": "*"}})
+    CORS(app, resources={r"/api/*": {"origins": "*", "allow_headers": ["Authorization", "Content-Type"]}})
+
+print("after cors", file=sys.stderr); sys.stderr.flush()
 
 # Respect X-Forwarded-* headers from Render/Netlify proxies.
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
+print("after proxyfix", file=sys.stderr); sys.stderr.flush()
+
 # Use SQLite for local development ease, but can switch to Postgres via DATABASE_URL
-app.config['SQLALCHEMY_DATABASE_URI'] = normalize_database_url(
-    os.getenv('DATABASE_URL', 'sqlite:///incubator.db')
-)
+db_uri = normalize_database_url(os.getenv('DATABASE_URL', 'sqlite:///incubator.db'))
+app.config['SQLALCHEMY_DATABASE_URI'] = db_uri
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+
+engine_options = {
     'pool_pre_ping': True,
     'pool_recycle': 300,
+    'pool_size': 10,
+    'max_overflow': 20,
+    'connect_args': {
+        'connect_timeout': 15,
+        'sslmode': 'require'
+    }
 }
 
+
+# Force IPv4 to prevent connection fallback delays or issues with IPv6
+if db_uri.startswith('postgresql'):
+    import socket
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(db_uri)
+        if parsed.hostname and not parsed.hostname.replace('.', '').isdigit():
+            ipv4 = socket.gethostbyname(parsed.hostname)
+            engine_options['connect_args']['host'] = ipv4
+            # We still need the original hostname for SSL certificate verification
+            # but psycopg2 usually handles this if we use 'host' and 'hostaddr' is not set, 
+            # or we can pass it in the connection string.
+            print(f"Resolved DB host {parsed.hostname} to {ipv4} for stability", file=sys.stderr)
+    except Exception as e:
+        print(f"Failed to resolve DB host: {e}", file=sys.stderr)
+
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = engine_options
+
+print("before db init", file=sys.stderr); sys.stderr.flush()
 db.init_app(app)
+print("after db init", file=sys.stderr); sys.stderr.flush()
 
 # Test database connection
 def test_db_connection():
@@ -194,84 +235,23 @@ def get_public_backend_base_url():
 def init_db():
     """Create tables, retrying up to 5 times with back-off to survive slow cold starts."""
     import time as _time
+    print("entering init_db", file=sys.stderr); sys.stderr.flush()
     for attempt in range(1, 6):
         try:
+            print(f"init_db attempt {attempt}", file=sys.stderr); sys.stderr.flush()
             db.create_all()
+            print("create_all passed", file=sys.stderr); sys.stderr.flush()
 
-            # Migrate: add columns if they don't exist
-            migrations = [
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS name VARCHAR(120)",
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT",
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(500)",
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS github_url VARCHAR(500)",
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS twitter_url VARCHAR(500)",
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS skills JSON",
-                "ALTER TABLE catalog_entries ADD COLUMN IF NOT EXISTS visibility VARCHAR(20) DEFAULT 'private'",
-                "ALTER TABLE catalog_entries ADD COLUMN IF NOT EXISTS published_at TIMESTAMP",
-                "ALTER TABLE catalog_entries ADD COLUMN IF NOT EXISTS view_count INTEGER DEFAULT 0",
-                "ALTER TABLE catalog_entries ADD COLUMN IF NOT EXISTS tags JSON",
-                # Reaction table
-                """CREATE TABLE IF NOT EXISTS reactions (
-                    id VARCHAR(36) PRIMARY KEY,
-                    catalog_entry_id VARCHAR(36) REFERENCES catalog_entries(id),
-                    user_id VARCHAR(36) REFERENCES users(id),
-                    reaction_type VARCHAR(20) NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    CONSTRAINT uq_reaction_user_entry_type UNIQUE (catalog_entry_id, user_id, reaction_type)
-                )""",
-                # Connect requests table
-                """CREATE TABLE IF NOT EXISTS connect_requests (
-                    id VARCHAR(36) PRIMARY KEY,
-                    catalog_entry_id VARCHAR(36) REFERENCES catalog_entries(id),
-                    requester_id VARCHAR(36) REFERENCES users(id),
-                    owner_id VARCHAR(36) REFERENCES users(id),
-                    role VARCHAR(30) NOT NULL,
-                    message TEXT,
-                    status VARCHAR(20) DEFAULT 'pending',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    CONSTRAINT uq_connect_requester_entry_role UNIQUE (catalog_entry_id, requester_id, role)
-                )""",
-                # Notifications table
-                """CREATE TABLE IF NOT EXISTS notifications (
-                    id VARCHAR(36) PRIMARY KEY,
-                    user_id VARCHAR(36) REFERENCES users(id),
-                    type VARCHAR(30) NOT NULL,
-                    title VARCHAR(200) NOT NULL,
-                    message TEXT,
-                    link VARCHAR(500),
-                    is_read BOOLEAN DEFAULT FALSE,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )""",
-                # Idea updates timeline table
-                """CREATE TABLE IF NOT EXISTS idea_updates (
-                    id VARCHAR(36) PRIMARY KEY,
-                    catalog_entry_id VARCHAR(36) REFERENCES catalog_entries(id),
-                    user_id VARCHAR(36) REFERENCES users(id),
-                    content TEXT NOT NULL,
-                    update_type VARCHAR(30) DEFAULT 'progress',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )""",
-            ]
-            for sql in migrations:
-                try:
-                    db.session.execute(db.text(sql))
-                    db.session.commit()
-                except Exception as col_err:
-                    db.session.rollback()
-
+            print("running test_db_connection", file=sys.stderr); sys.stderr.flush()
             test_db_connection()
-            print("Database initialized OK")
+            print("Database initialized OK", file=sys.stderr); sys.stderr.flush()
             return
         except Exception as e:
-            print(f"DB init attempt {attempt}/5 failed: {e}")
+            print(f"DB init attempt {attempt}/5 failed: {e}", file=sys.stderr); sys.stderr.flush()
             if attempt < 5:
                 _time.sleep(attempt * 3)  # 3s, 6s, 9s, 12s
-    print("WARNING: DB init failed after 5 attempts. Tables will be created on first request.")
+    print("WARNING: DB init failed after 5 attempts. Tables will be created on first request.", file=sys.stderr); sys.stderr.flush()
 
-with app.app_context():
-    init_db()
 
 @app.route('/', methods=['GET'])
 def root_status():
@@ -371,8 +351,17 @@ def get_catalogs():
     # Ensure clean session
     db.session.rollback()
     try:
-        entries = CatalogEntry.query.filter_by(user_id=g.user_id).order_by(CatalogEntry.created_at.desc()).all()
-        result = [serialize_entry(e, g.user_id) for e in entries]
+        # Get entries owned by user
+        owned_entries = CatalogEntry.query.filter_by(user_id=g.user_id).all()
+        
+        # Get entries where user is a collaborator
+        collab_entries = CatalogEntry.query.join(Collaborator).filter(Collaborator.user_id == g.user_id).all()
+        
+        # Combine, remove duplicates (if any), and sort by created_at desc
+        entries = list(set(owned_entries + collab_entries))
+        entries.sort(key=lambda x: x.created_at if x.created_at else datetime.min, reverse=True)
+        
+        result = serialize_entries_batch(entries, g.user_id)
         return jsonify(result), 200
     except Exception as e:
         print(f"Error fetching catalogs: {e}")
@@ -540,7 +529,9 @@ def get_chat_messages(entry_id):
         entry = CatalogEntry.query.get(entry_id)
         if not entry:
             return jsonify({"error": "Catalog entry not found"}), 404
-        if entry.user_id != g.user_id:
+        # Check if owner or collaborator
+        is_collab = Collaborator.query.filter_by(user_id=g.user_id, catalog_entry_id=entry_id).first()
+        if entry.user_id != g.user_id and not is_collab:
             return jsonify({"error": "Unauthorized"}), 403
 
         messages = ChatMessage.query.filter_by(catalog_entry_id=entry_id).order_by(ChatMessage.created_at.asc()).all()
@@ -726,7 +717,7 @@ def search_catalogs():
                 )
             ).limit(limit).all()
 
-            result = [serialize_entry(entry, g.user_id) for entry in entries]
+            result = serialize_entries_batch(entries, g.user_id)
             return jsonify(result), 200
 
         # Generate embedding for query text using SentenceTransformer
@@ -774,7 +765,7 @@ def search_catalogs():
                 ordered_entries = entries
                 print(f"Text search returned {len(ordered_entries)} results")
             
-            result = [serialize_entry(entry, g.user_id) for entry in ordered_entries]
+            result = serialize_entries_batch(ordered_entries, g.user_id)
             return jsonify(result), 200
         except Exception as e:
             print(f"Error querying Pinecone: {e}")
@@ -787,7 +778,7 @@ def search_catalogs():
                 )
             ).limit(limit).all()
             
-            result = [serialize_entry(entry, g.user_id) for entry in entries]
+            result = serialize_entries_batch(entries, g.user_id)
             return jsonify(result), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 400
@@ -949,7 +940,9 @@ def update_catalog_entry(entry_id):
         entry = CatalogEntry.query.get(entry_id)
         if not entry:
             return jsonify({"error": "Catalog entry not found"}), 404
-        if entry.user_id != g.user_id:
+        # Check if owner or collaborator
+        is_collab = Collaborator.query.filter_by(user_id=g.user_id, catalog_entry_id=entry_id).first()
+        if entry.user_id != g.user_id and not is_collab:
             return jsonify({"error": "Unauthorized"}), 403
 
         payload = request.json or {}
@@ -1055,6 +1048,132 @@ def compute_idea_score(entry_id):
     return round(score, 1)
 
 
+def serialize_entries_batch(entries, user_id=None):
+    """Batch serialize multiple entries with minimal DB queries (N+1 fix)."""
+    if not entries:
+        return []
+    entry_ids = [e.id for e in entries]
+    owner_ids = list(set(e.user_id for e in entries))
+
+    from concurrent.futures import ThreadPoolExecutor
+    from flask import current_app
+    app_obj = current_app._get_current_object()
+
+    def fetch_in_context(func):
+        with app_obj.app_context():
+            try:
+                return func()
+            finally:
+                db.session.remove()
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        f_likes = executor.submit(fetch_in_context, lambda: dict(db.session.query(Like.catalog_entry_id, db.func.count(Like.id)).filter(Like.catalog_entry_id.in_(entry_ids)).group_by(Like.catalog_entry_id).all()))
+        f_comments = executor.submit(fetch_in_context, lambda: dict(db.session.query(Comment.catalog_entry_id, db.func.count(Comment.id)).filter(Comment.catalog_entry_id.in_(entry_ids)).group_by(Comment.catalog_entry_id).all()))
+        f_bookmarks = executor.submit(fetch_in_context, lambda: dict(db.session.query(Bookmark.catalog_entry_id, db.func.count(Bookmark.id)).filter(Bookmark.catalog_entry_id.in_(entry_ids)).group_by(Bookmark.catalog_entry_id).all()))
+        f_connects = executor.submit(fetch_in_context, lambda: dict(db.session.query(ConnectRequest.catalog_entry_id, db.func.count(ConnectRequest.id)).filter(ConnectRequest.catalog_entry_id.in_(entry_ids), ConnectRequest.status == 'accepted').group_by(ConnectRequest.catalog_entry_id).all()))
+        f_updates = executor.submit(fetch_in_context, lambda: dict(db.session.query(IdeaUpdate.catalog_entry_id, db.func.count(IdeaUpdate.id)).filter(IdeaUpdate.catalog_entry_id.in_(entry_ids)).group_by(IdeaUpdate.catalog_entry_id).all()))
+        f_reactions = executor.submit(fetch_in_context, lambda: db.session.query(Reaction.catalog_entry_id, Reaction.reaction_type, db.func.count(Reaction.id)).filter(Reaction.catalog_entry_id.in_(entry_ids)).group_by(Reaction.catalog_entry_id, Reaction.reaction_type).all())
+        f_authors = executor.submit(fetch_in_context, lambda: {u.id: u for u in User.query.filter(User.id.in_(owner_ids)).all()})
+        f_collabs = executor.submit(fetch_in_context, lambda: db.session.query(Collaborator.catalog_entry_id, User, Collaborator.role).join(User, Collaborator.user_id == User.id).filter(Collaborator.catalog_entry_id.in_(entry_ids)).all())
+
+        if user_id:
+            f_user_likes = executor.submit(fetch_in_context, lambda: set(r[0] for r in db.session.query(Like.catalog_entry_id).filter(Like.catalog_entry_id.in_(entry_ids), Like.user_id == user_id).all()))
+            f_user_bookmarks = executor.submit(fetch_in_context, lambda: set(r[0] for r in db.session.query(Bookmark.catalog_entry_id).filter(Bookmark.catalog_entry_id.in_(entry_ids), Bookmark.user_id == user_id).all()))
+            f_user_reacts = executor.submit(fetch_in_context, lambda: db.session.query(Reaction.catalog_entry_id, Reaction.reaction_type).filter(Reaction.catalog_entry_id.in_(entry_ids), Reaction.user_id == user_id).all())
+            f_user_connects = executor.submit(fetch_in_context, lambda: set(r[0] for r in db.session.query(ConnectRequest.catalog_entry_id).filter(ConnectRequest.catalog_entry_id.in_(entry_ids), ConnectRequest.requester_id == user_id).all()))
+
+        # Await all futures
+        like_counts = f_likes.result()
+        comment_counts = f_comments.result()
+        bookmark_counts = f_bookmarks.result()
+        connect_counts = f_connects.result()
+        update_counts = f_updates.result()
+        reaction_rows = f_reactions.result()
+        authors = f_authors.result()
+        collab_rows = f_collabs.result()
+
+        user_likes = set()
+        user_bookmarks = set()
+        user_reactions_map = {}
+        user_connects = set()
+        
+        if user_id:
+            user_likes = f_user_likes.result()
+            user_bookmarks = f_user_bookmarks.result()
+            for eid, rtype in f_user_reacts.result():
+                user_reactions_map.setdefault(eid, []).append(rtype)
+            user_connects = f_user_connects.result()
+
+    reaction_map = {}
+    for eid, rtype, cnt in reaction_rows:
+        reaction_map.setdefault(eid, {})[rtype] = cnt
+
+    collab_map = {}
+    for eid, user_obj, role in collab_rows:
+        collab_map.setdefault(eid, []).append({
+            "id": user_obj.id,
+            "name": user_obj.name or user_obj.email.split('@')[0],
+            "avatar_url": user_obj.avatar_url,
+            "role": role
+        })
+
+    results = []
+    weights = {'brilliant': 3, 'interested': 1, 'sellable': 4, 'build_worthy': 3, 'needs_work': 0.5}
+    for e in entries:
+        reactions_summary = {rtype: reaction_map.get(e.id, {}).get(rtype, 0) for rtype in REACTION_TYPES}
+        score = sum(reactions_summary.get(rt, 0) * w for rt, w in weights.items())
+        score += comment_counts.get(e.id, 0) * 2
+        score += bookmark_counts.get(e.id, 0) * 1.5
+
+        data = {
+            "id": e.id, "user_id": e.user_id, "raw_input": e.raw_input,
+            "input_type": e.input_type, "status": e.status, "summary": e.summary,
+            "tech_stack": e.tech_stack, "pros_cons": e.pros_cons,
+            "similar_tools": e.similar_tools, "creator": e.creator, "link": e.link,
+            "installation": e.installation, "unique_features": e.unique_features,
+            "market_trend": e.market_trend, "mermaid_syntax": e.mermaid_syntax,
+            "image_url": e.image_url,
+            "visibility": getattr(e, 'visibility', 'private'),
+            "published_at": e.published_at.isoformat() if getattr(e, 'published_at', None) else None,
+            "view_count": getattr(e, 'view_count', 0),
+            "tags": getattr(e, 'tags', None),
+            "visible_fields": getattr(e, 'visible_fields', None),
+            "created_at": e.created_at.isoformat(),
+            "updated_at": e.updated_at.isoformat() if getattr(e, 'updated_at', None) else None,
+            "like_count": like_counts.get(e.id, 0),
+            "comment_count": comment_counts.get(e.id, 0),
+            "bookmark_count": bookmark_counts.get(e.id, 0),
+            "connect_count": connect_counts.get(e.id, 0),
+            "updates_count": update_counts.get(e.id, 0),
+            "reactions": reactions_summary,
+            "idea_score": round(score, 1),
+            "collaborators": collab_map.get(e.id, []),
+        }
+        author = authors.get(e.user_id)
+        if author:
+            data["author"] = {
+                "id": author.id,
+                "name": author.name or author.email.split('@')[0],
+                "avatar_url": author.avatar_url,
+            }
+        if user_id:
+            data["liked_by_user"] = e.id in user_likes
+            data["bookmarked_by_user"] = e.id in user_bookmarks
+            data["user_reactions"] = user_reactions_map.get(e.id, [])
+            data["connect_sent"] = e.id in user_connects
+
+        # Apply visible_fields filter for non-owner viewers
+        vis = getattr(e, 'visible_fields', None)
+        if vis and user_id != e.user_id:
+            for field in ['summary', 'tech_stack', 'pros_cons', 'similar_tools',
+                          'mermaid_syntax', 'image_url', 'market_trend', 'unique_features']:
+                if field not in vis:
+                    data[field] = None
+
+        results.append(data)
+    return results
+
+
 def serialize_entry(e, user_id=None):
     """Serialize a CatalogEntry for API responses with community data."""
     data = {
@@ -1078,6 +1197,7 @@ def serialize_entry(e, user_id=None):
         "published_at": e.published_at.isoformat() if getattr(e, 'published_at', None) else None,
         "view_count": getattr(e, 'view_count', 0),
         "tags": getattr(e, 'tags', None),
+        "visible_fields": getattr(e, 'visible_fields', None),
         "created_at": e.created_at.isoformat(),
         "updated_at": e.updated_at.isoformat() if getattr(e, 'updated_at', None) else None,
     }
@@ -1114,18 +1234,50 @@ def serialize_entry(e, user_id=None):
         data["user_reactions"] = [r.reaction_type for r in user_reactions]
         # Whether user has sent a connect request
         data["connect_sent"] = ConnectRequest.query.filter_by(catalog_entry_id=e.id, requester_id=user_id).first() is not None
+
+    # Apply visible_fields filter for non-owner viewers
+    vis = getattr(e, 'visible_fields', None)
+    if vis and user_id != e.user_id:
+        hideable = ['summary', 'tech_stack', 'pros_cons', 'similar_tools',
+                    'mermaid_syntax', 'image_url', 'market_trend', 'unique_features']
+        for field in hideable:
+            if field not in vis:
+                data[field] = None
     return data
 
 
+import time
+from cachetools import TTLCache
+feed_cache = TTLCache(maxsize=100, ttl=15.0)
+
 @app.route('/api/community/feed', methods=['GET'])
 def community_feed():
-    """Public community feed — returns published entries."""
+    """Public community feed — returns published entries with 15s cache."""
     try:
         page = request.args.get('page', 1, type=int)
         per_page = request.args.get('per_page', 20, type=int)
         sort = request.args.get('sort', 'recent')  # recent | popular
         filter_type = request.args.get('type', 'all')  # all | idea | tool
         search = request.args.get('q', '').strip()
+
+        # Get user_id if authenticated
+        user_id = None
+        auth_header = request.headers.get('Authorization', '')
+        if auth_header.startswith('Bearer '):
+            token = auth_header[7:]
+            su = verify_supabase_token(token)
+            if su:
+                user_id = su.get('id')
+
+        # Cache key based on all parameters and user_id (for personalized likes/bookmarks)
+        cache_key = f"feed_{page}_{per_page}_{sort}_{filter_type}_{search}_{user_id}"
+        if cache_key in feed_cache:
+            return jsonify({
+                "entries": feed_cache[cache_key]["entries"],
+                "total": feed_cache[cache_key]["total"],
+                "pages": feed_cache[cache_key]["pages"],
+                "current_page": page
+            }), 200
 
         query = CatalogEntry.query.filter(
             CatalogEntry.visibility == 'public',
@@ -1150,8 +1302,11 @@ def community_feed():
             query = query.order_by(CatalogEntry.published_at.desc())
         else:
             query = query.order_by(CatalogEntry.published_at.desc())
+            
+        t1 = time.time()
 
         pagination = query.paginate(page=page, per_page=per_page, error_out=False)
+        t2 = time.time()
 
         # Get user_id if authenticated
         user_id = None
@@ -1161,12 +1316,22 @@ def community_feed():
             su = verify_supabase_token(token)
             if su:
                 user_id = su.get('id')
+                
+        t3 = time.time()
 
-        result = [serialize_entry(e, user_id) for e in pagination.items]
-
+        result = serialize_entries_batch(list(pagination.items), user_id)
+        
         # Sort by idea_score for trending
         if sort == 'trending':
             result.sort(key=lambda x: x.get('idea_score', 0), reverse=True)
+
+        feed_cache[cache_key] = {
+            "entries": result,
+            "total": pagination.total,
+            "pages": pagination.pages,
+            "page": page,
+            "per_page": per_page
+        }
 
         return jsonify({
             "entries": result,
@@ -1177,6 +1342,47 @@ def community_feed():
         }), 200
     except Exception as e:
         print(f"Error in community feed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+
+@app.route('/api/community/leaderboard', methods=['GET'])
+def community_leaderboard():
+    """Returns top users based on community activity."""
+    try:
+        users = User.query.all()
+        leaderboard = []
+        
+        for u in users:
+            score = 0
+            pub_count = CatalogEntry.query.filter_by(user_id=u.id, visibility='public').count()
+            score += pub_count * 10
+            
+            update_count = IdeaUpdate.query.filter_by(user_id=u.id).count()
+            score += update_count * 5
+            
+            entry_ids = [e.id for e in CatalogEntry.query.filter_by(user_id=u.id).all()]
+            if entry_ids:
+                likes_received = Like.query.filter(Like.catalog_entry_id.in_(entry_ids)).count()
+                score += likes_received * 2
+                
+                reactions_received = Reaction.query.filter(Reaction.catalog_entry_id.in_(entry_ids)).count()
+                score += reactions_received * 1
+            
+            if score > 0 or pub_count > 0:
+                leaderboard.append({
+                    "id": u.id,
+                    "name": u.name or u.email.split('@')[0],
+                    "avatar_url": u.avatar_url,
+                    "score": score,
+                    "published_count": pub_count,
+                    "updates_count": update_count
+                })
+        
+        leaderboard.sort(key=lambda x: x['score'], reverse=True)
+        return jsonify(leaderboard[:10]), 200
+    except Exception as e:
+        print(f"Leaderboard error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -1224,7 +1430,10 @@ def create_idea_update(entry_id):
         entry = CatalogEntry.query.get(entry_id)
         if not entry:
             return jsonify({"error": "Entry not found"}), 404
-        if entry.user_id != g.user_id:
+        
+        # Check if owner or collaborator
+        is_collab = Collaborator.query.filter_by(user_id=g.user_id, catalog_entry_id=entry_id).first()
+        if entry.user_id != g.user_id and not is_collab:
             return jsonify({"error": "Unauthorized"}), 403
 
         payload = request.json or {}
@@ -1332,6 +1541,8 @@ def publish_entry(entry_id):
         entry.published_at = datetime.utcnow()
         if data.get('tags'):
             entry.tags = data['tags']
+        if 'visible_fields' in data:
+            entry.visible_fields = data['visible_fields']  # list of field names or null
         db.session.commit()
 
         return jsonify({"status": "published", "entry": serialize_entry(entry, g.user_id)}), 200
@@ -1505,6 +1716,7 @@ def get_profile():
             "twitter_url": user.twitter_url,
             "skills": user.skills,
             "created_at": user.created_at.isoformat(),
+            "is_admin": user.email == os.getenv('ADMIN_EMAIL', 'abhijeet@mindinspo.local')
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1593,6 +1805,90 @@ def update_profile():
 
         db.session.commit()
         return jsonify({"status": "updated"}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+# ============================================================
+# Admin API
+# ============================================================
+
+def admin_required(f):
+    @wraps(f)
+    @auth_required
+    def decorated(*args, **kwargs):
+        admin_email = os.getenv('ADMIN_EMAIL', 'abhijeet@mindinspo.local')
+        if g.user_email != admin_email:
+            return jsonify({"error": "Admin access required"}), 403
+        return f(*args, **kwargs)
+    return decorated
+
+@app.route('/api/admin/stats', methods=['GET'])
+@admin_required
+def get_admin_stats():
+    print("DEBUG: Entering get_admin_stats", file=sys.stderr); sys.stderr.flush()
+    try:
+        user_count = User.query.count()
+        entry_count = CatalogEntry.query.count()
+        idea_count = CatalogEntry.query.filter_by(input_type='idea').count()
+        tool_count = CatalogEntry.query.filter_by(input_type='tool').count()
+        
+        # Check if 'visibility' column exists in CatalogEntry
+        public_count = 0
+        try:
+            public_count = CatalogEntry.query.filter_by(visibility='public').count()
+        except Exception as e:
+            print(f"DEBUG: visibility count failed (maybe column missing): {e}", file=sys.stderr); sys.stderr.flush()
+
+        comment_count = 0
+        try:
+            comment_count = Comment.query.count()
+        except Exception as e:
+            print(f"DEBUG: comment count failed: {e}", file=sys.stderr); sys.stderr.flush()
+        
+        print(f"DEBUG: Admin Stats - Users: {user_count}, Entries: {entry_count}", file=sys.stderr); sys.stderr.flush()
+        
+        return jsonify({
+            "users": user_count,
+            "entries": entry_count,
+            "ideas": idea_count,
+            "tools": tool_count,
+            "public_entries": public_count,
+            "comments": comment_count
+        }), 200
+    except Exception as e:
+        print(f"ERROR in get_admin_stats: {e}", file=sys.stderr); sys.stderr.flush()
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/admin/users', methods=['GET'])
+@admin_required
+def admin_get_users():
+    try:
+        users = User.query.order_by(User.created_at.desc()).all()
+        return jsonify([{
+            "id": u.id,
+            "email": u.email,
+            "name": u.name,
+            "created_at": u.created_at.isoformat()
+        } for u in users]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/admin/entries', methods=['GET'])
+@admin_required
+def admin_get_entries():
+    try:
+        entries = CatalogEntry.query.order_by(CatalogEntry.created_at.desc()).all()
+        return jsonify([{
+            "id": e.id,
+            "user_id": e.user_id,
+            "raw_input": e.raw_input,
+            "status": e.status,
+            "input_type": e.input_type,
+            "visibility": e.visibility,
+            "created_at": e.created_at.isoformat() if e.created_at else None
+        } for e in entries]), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1812,6 +2108,18 @@ def respond_to_connect(request_id):
 
         req.status = 'accepted' if action == 'accept' else 'declined'
         req.updated_at = datetime.utcnow()
+        
+        if action == 'accept':
+            # Add as a formal collaborator
+            existing_collab = Collaborator.query.filter_by(user_id=req.requester_id, catalog_entry_id=req.catalog_entry_id).first()
+            if not existing_collab:
+                collab = Collaborator(
+                    user_id=req.requester_id,
+                    catalog_entry_id=req.catalog_entry_id,
+                    role=req.role
+                )
+                db.session.add(collab)
+        
         db.session.commit()
 
         # Notify the requester
@@ -1831,6 +2139,45 @@ def respond_to_connect(request_id):
 
         return jsonify({"status": req.status, "request_id": req.id}), 200
     except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/catalogs/<entry_id>/collaborators/<user_id>', methods=['DELETE'])
+@auth_required
+def remove_collaborator(entry_id, user_id):
+    """Remove a collaborator from a project. Only the owner can do this."""
+    try:
+        entry = CatalogEntry.query.get_or_404(entry_id)
+        if entry.user_id != g.user_id:
+            return jsonify({"error": "Only the project owner can remove collaborators"}), 403
+            
+        collab = Collaborator.query.filter_by(catalog_entry_id=entry_id, user_id=user_id).first()
+        if not collab:
+            return jsonify({"error": "Collaborator not found"}), 404
+            
+        collab_name = collab.user.name or 'A collaborator'
+        db.session.delete(collab)
+        
+        # Also add a system message to the chat
+        try:
+            sys_msg = ChatMessage(
+                entry_id=entry_id,
+                user_id=None,
+                message=f"SYSTEM_MESSAGE::info::{collab_name} was removed from the team by the owner.",
+                is_user=False
+            )
+            db.session.add(sys_msg)
+        except Exception as e:
+            print(f"Failed to add removal system message: {e}")
+
+        db.session.commit()
+        
+        # Notify the user who was removed
+        add_notification(user_id, f"You have been removed from the team for project '{entry.raw_input}'", "info")
+        
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
 
@@ -1889,11 +2236,17 @@ def mark_notifications_read():
 
 
 
-# Start background thread
-retry_thread = threading.Thread(target=background_retry_job, args=(app,), daemon=True)
-retry_thread.start()
 
 if __name__ == '__main__':
+    print("before app_context", file=sys.stderr); sys.stderr.flush()
+    with app.app_context():
+        init_db()
+    print("after app_context", file=sys.stderr); sys.stderr.flush()
+
+    # Start background thread
+    retry_thread = threading.Thread(target=background_retry_job, args=(app,), daemon=True)
+    retry_thread.start()
+
     is_debug = os.getenv('FLASK_ENV', 'development').lower() == 'development'
     app.run(
         host='0.0.0.0',
