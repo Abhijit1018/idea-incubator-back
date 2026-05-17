@@ -2139,6 +2139,51 @@ def respond_to_connect(request_id):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/connect/workspace/<request_id>', methods=['GET'])
+@auth_required
+def get_workspace(request_id):
+    req = ConnectRequest.query.filter_by(id=request_id).first()
+    if not req:
+        return jsonify({'error': 'Not found'}), 404
+
+    if g.user_id not in (req.requester_id, req.owner_id):
+        return jsonify({'error': 'Forbidden'}), 403
+
+    if req.status != 'accepted':
+        return jsonify({'error': 'Request not accepted yet'}), 403
+
+    entry = CatalogEntry.query.filter_by(id=req.catalog_entry_id).first()
+    if not entry:
+        return jsonify({'error': 'Idea not found'}), 404
+
+    partner_id = req.requester_id if g.user_id == req.owner_id else req.owner_id
+    partner = User.query.filter_by(id=partner_id).first()
+
+    return jsonify({
+        'request_id': req.id,
+        'role': req.role,
+        'status': req.status,
+        'partner': {
+            'id': partner.id,
+            'name': partner.name or partner.email,
+            'email': partner.email,
+            'avatar_url': partner.avatar_url,
+        },
+        'entry': {
+            'id': entry.id,
+            'raw_input': entry.raw_input,
+            'summary': entry.summary,
+            'tech_stack': entry.tech_stack,
+            'pros_cons': entry.pros_cons,
+            'similar_tools': entry.similar_tools,
+            'mermaid_syntax': entry.mermaid_syntax,
+            'image_url': entry.image_url,
+            'status': entry.status,
+            'tags': entry.tags,
+        },
+    })
+
+
 @app.route('/api/catalogs/<entry_id>/collaborators/<user_id>', methods=['DELETE'])
 @auth_required
 def remove_collaborator(entry_id, user_id):
