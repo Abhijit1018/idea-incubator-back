@@ -254,14 +254,52 @@ def public_stats():
                 'image_url': e.image_url,
             }
 
+        recent_users = User.query.order_by(User.created_at.desc()).limit(4).all()
+
+        def user_preview(u):
+            display = u.name or u.email or ''
+            initials = ''.join(p[0].upper() for p in display.split()[:2]) if display else '?'
+            return {'initials': initials, 'avatar_url': u.avatar_url}
+
         return jsonify({
             'total_users': total_users,
             'total_ideas': total_ideas,
             'public_ideas': public_ideas,
             'recent': [mini_serialize(e) for e in recent_public],
+            'recent_users': [user_preview(u) for u in recent_users],
         })
     except Exception:
-        return jsonify({'total_users': 0, 'total_ideas': 0, 'public_ideas': 0, 'recent': []}), 200
+        return jsonify({'total_users': 0, 'total_ideas': 0, 'public_ideas': 0, 'recent': [], 'recent_users': []}), 200
+
+
+@app.route('/api/account/delete', methods=['DELETE'])
+@auth_required
+def delete_account():
+    user_id = g.user_id
+    try:
+        Notification.query.filter_by(user_id=user_id).delete()
+        ConnectRequest.query.filter(
+            (ConnectRequest.requester_id == user_id) | (ConnectRequest.owner_id == user_id)
+        ).delete(synchronize_session=False)
+        Collaborator.query.filter_by(user_id=user_id).delete()
+        IdeaUpdate.query.filter(
+            IdeaUpdate.catalog_entry_id.in_(
+                db.session.query(CatalogEntry.id).filter_by(user_id=user_id)
+            )
+        ).delete(synchronize_session=False)
+        Reaction.query.filter_by(user_id=user_id).delete()
+        Bookmark.query.filter_by(user_id=user_id).delete()
+        Comment.query.filter_by(user_id=user_id).delete()
+        ChatMessage.query.filter_by(user_id=user_id).delete()
+        CatalogEntry.query.filter_by(user_id=user_id).delete()
+        User.query.filter_by(id=user_id).delete()
+        db.session.commit()
+        return jsonify({'message': 'Account deleted'}), 200
+    except Exception as e:
+        db.session.rollback()
+        print(f"Account delete error for {user_id}: {e}")
+        return jsonify({'error': 'Failed to delete account'}), 500
+
 
 def background_retry_job(app):
     """
