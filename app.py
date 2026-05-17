@@ -234,6 +234,35 @@ def root_status():
 def healthz():
     return jsonify({"status": "ok"}), 200
 
+@app.route('/api/stats', methods=['GET'])
+def public_stats():
+    try:
+        total_users = User.query.count()
+        total_ideas = CatalogEntry.query.filter_by(status='completed').count()
+        public_ideas = CatalogEntry.query.filter_by(visibility='public', status='completed').count()
+        recent_public = CatalogEntry.query.filter_by(
+            visibility='public', status='completed'
+        ).order_by(CatalogEntry.published_at.desc()).limit(3).all()
+
+        def mini_serialize(e):
+            tags = e.tags or []
+            return {
+                'id': e.id,
+                'raw_input': e.raw_input,
+                'summary': (e.summary or '')[:120],
+                'tags': tags[:3],
+                'image_url': e.image_url,
+            }
+
+        return jsonify({
+            'total_users': total_users,
+            'total_ideas': total_ideas,
+            'public_ideas': public_ideas,
+            'recent': [mini_serialize(e) for e in recent_public],
+        })
+    except Exception:
+        return jsonify({'total_users': 0, 'total_ideas': 0, 'public_ideas': 0, 'recent': []}), 200
+
 def background_retry_job(app):
     """
     Background job that periodically checks for pending entries
