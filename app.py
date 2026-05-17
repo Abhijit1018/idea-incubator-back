@@ -1,41 +1,24 @@
 import sys
-print("STARTING APP.PY", file=sys.stderr)
-sys.stderr.flush()
 import os
-print("imported os", file=sys.stderr); sys.stderr.flush()
 import base64
-print("imported base64", file=sys.stderr); sys.stderr.flush()
 from functools import wraps
-print("imported wraps", file=sys.stderr); sys.stderr.flush()
 from flask import Flask, request, jsonify, g
-print("imported flask", file=sys.stderr); sys.stderr.flush()
 from flask_cors import CORS
-print("imported flask_cors", file=sys.stderr); sys.stderr.flush()
 from models import db, User, CatalogEntry, ChatMessage, CatalogEmbedding, Comment, Like, Bookmark, Reaction, ConnectRequest, Notification, IdeaUpdate, Collaborator, REACTION_TYPES, CONNECT_ROLES
-print("imported models", file=sys.stderr); sys.stderr.flush()
 from datetime import datetime
-print("imported datetime", file=sys.stderr); sys.stderr.flush()
 import uuid
-print("imported uuid", file=sys.stderr); sys.stderr.flush()
 import requests as http_requests
-print("imported requests", file=sys.stderr); sys.stderr.flush()
 import json
-print("imported json", file=sys.stderr); sys.stderr.flush()
 from werkzeug.utils import secure_filename
-print("imported secure_filename", file=sys.stderr); sys.stderr.flush()
 from werkzeug.middleware.proxy_fix import ProxyFix
-print("imported ProxyFix", file=sys.stderr); sys.stderr.flush()
 from dotenv import load_dotenv
-print("imported load_dotenv", file=sys.stderr); sys.stderr.flush()
 import threading
 import time
 from datetime import timedelta
 
 Pinecone = None
 ServerlessSpec = None
-print("before load_dotenv", file=sys.stderr); sys.stderr.flush()
 load_dotenv()
-print("after load_dotenv", file=sys.stderr); sys.stderr.flush()
 
 # Vector services are optional. Keep disabled on small instances by default.
 embedding_model = None
@@ -69,9 +52,7 @@ if ENABLE_VECTOR_SEARCH and pinecone_api_key and Pinecone and ServerlessSpec:
     except Exception as e:
         print(f"Pinecone initialization failed: {e}")
 
-print("before flask app init", file=sys.stderr); sys.stderr.flush()
 app = Flask(__name__)
-print("after flask app init", file=sys.stderr); sys.stderr.flush()
 
 def normalize_database_url(database_url):
     if database_url.startswith('postgres://'):
@@ -85,12 +66,8 @@ if cors_origins_raw:
 else:
     CORS(app, resources={r"/api/*": {"origins": "*", "allow_headers": ["Authorization", "Content-Type"]}})
 
-print("after cors", file=sys.stderr); sys.stderr.flush()
-
 # Respect X-Forwarded-* headers from Render/Netlify proxies.
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
-
-print("after proxyfix", file=sys.stderr); sys.stderr.flush()
 
 # Database Configuration
 db_uri = normalize_database_url(os.getenv('DATABASE_URL', 'sqlite:///incubator.db'))
@@ -125,26 +102,19 @@ if db_uri.startswith('postgresql'):
 
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = engine_options
 
-print("before db.init_app", file=sys.stderr); sys.stderr.flush()
 db.init_app(app)
-print("after db.init_app", file=sys.stderr); sys.stderr.flush()
 
 def init_db():
     """Create tables, retrying up to 5 times with back-off to survive slow cold starts."""
     import time as _time
-    print("entering init_db", file=sys.stderr); sys.stderr.flush()
     for attempt in range(1, 6):
         try:
-            print(f"init_db attempt {attempt}", file=sys.stderr); sys.stderr.flush()
             db.create_all()
-            print("create_all passed", file=sys.stderr); sys.stderr.flush()
-
-            print("running test_db_connection", file=sys.stderr); sys.stderr.flush()
             test_db_connection()
-            print("Database initialized OK", file=sys.stderr); sys.stderr.flush()
+            print("Database initialized OK", file=sys.stderr)
             return
         except Exception as e:
-            print(f"DB init attempt {attempt}/5 failed: {e}", file=sys.stderr); sys.stderr.flush()
+            print(f"DB init attempt {attempt}/5 failed: {e}", file=sys.stderr)
             _time.sleep(2)
 
 
