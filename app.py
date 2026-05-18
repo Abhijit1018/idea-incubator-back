@@ -1198,9 +1198,9 @@ def serialize_entries_batch(entries, user_id=None):
             data["user_reactions"] = user_reactions_map.get(e.id, [])
             data["connect_sent"] = e.id in user_connects
 
-        # Apply visible_fields filter for non-owner viewers
+        # Apply visible_fields filter — owner sees same as everyone else in community feed
         vis = getattr(e, 'visible_fields', None)
-        if vis and user_id != e.user_id:
+        if vis is not None:
             for field in ['summary', 'tech_stack', 'pros_cons', 'similar_tools',
                           'mermaid_syntax', 'image_url', 'market_trend', 'unique_features']:
                 if field not in vis:
@@ -1343,16 +1343,6 @@ def community_feed():
 
         pagination = query.paginate(page=page, per_page=per_page, error_out=False)
         t2 = time.time()
-
-        # Get user_id if authenticated
-        user_id = None
-        auth_header = request.headers.get('Authorization', '')
-        if auth_header.startswith('Bearer '):
-            token = auth_header[7:]
-            su = verify_supabase_token(token)
-            if su:
-                user_id = su.get('id')
-                
         t3 = time.time()
 
         result = serialize_entries_batch(list(pagination.items), user_id)
@@ -1580,6 +1570,7 @@ def publish_entry(entry_id):
         if 'visible_fields' in data:
             entry.visible_fields = data['visible_fields']  # list of field names or null
         db.session.commit()
+        feed_cache.clear()
 
         return jsonify({"status": "published", "entry": serialize_entry(entry, g.user_id)}), 200
     except Exception as e:
@@ -1600,6 +1591,7 @@ def unpublish_entry(entry_id):
         entry.visibility = 'private'
         entry.published_at = None
         db.session.commit()
+        feed_cache.clear()
 
         return jsonify({"status": "unpublished"}), 200
     except Exception as e:
