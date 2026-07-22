@@ -104,6 +104,31 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = engine_options
 
 db.init_app(app)
 
+# Rate limiting (per client IP, honoring X-Forwarded-For via ProxyFix). In-memory
+# storage is fine for a single Gunicorn worker; limits are intentionally generous
+# so real demo traffic is never throttled — only abuse/spam.
+try:
+    from flask_limiter import Limiter
+    from flask_limiter.util import get_remote_address
+    limiter = Limiter(
+        key_func=get_remote_address,
+        app=app,
+        default_limits=[],
+        storage_uri="memory://",
+        headers_enabled=True,
+    )
+except Exception as _lim_err:
+    print(f"Rate limiter unavailable, continuing without it: {_lim_err}", file=sys.stderr)
+
+    class _NoopLimiter:
+        def limit(self, *a, **k):
+            def deco(f):
+                return f
+            return deco
+
+    limiter = _NoopLimiter()
+
+
 def init_db():
     """Create tables, retrying up to 5 times with back-off to survive slow cold starts."""
     import time as _time
@@ -437,6 +462,7 @@ def background_retry_job(app):
             time.sleep(60) # Run check every 60 seconds
 
 @app.route('/api/ideas/submit', methods=['POST'])
+@limiter.limit("30 per hour; 5 per minute")
 @auth_required
 def submit_idea():
     data = request.json
@@ -529,19 +555,22 @@ def n8n_callback():
         if image_file and image_file.filename != '':
             filename = secure_filename(image_file.filename)
             unique_filename = f"{uuid.uuid4().hex}_{filename}"
-            
-            IMGBB_API_KEY = os.getenv('IMGBB_API_KEY', 'cc532d52d3ec271f34a5dd8227db219a')
-            
+
+            # Env-only — no hardcoded key. (The old committed key must be rotated.)
+            IMGBB_API_KEY = os.getenv('IMGBB_API_KEY', '')
+
             try:
+                if not IMGBB_API_KEY:
+                    raise RuntimeError("IMGBB_API_KEY not configured")
                 image_content = image_file.read()
                 b64_image = base64.b64encode(image_content).decode('utf-8')
-                
+
                 imgbb_res = http_requests.post(
                     "https://api.imgbb.com/1/upload",
                     data={"key": IMGBB_API_KEY, "image": b64_image, "name": filename},
                     timeout=20.0
                 )
-                
+
                 if imgbb_res.status_code == 200:
                     image_url = imgbb_res.json()['data']['url']
                     print(f"Image uploaded to ImgBB successfully: {image_url}")
@@ -890,6 +919,7 @@ def search_catalogs():
 
 
 @app.route('/api/webhooks/chat-message', methods=['POST'])
+@limiter.limit("40 per minute")
 @auth_required
 def chat_message_webhook():
     """Endpoint for frontend to initiate chat, which forwards to n8n"""
@@ -1685,13 +1715,20 @@ def get_comments(entry_id):
         return jsonify({"error": str(e)}), 500
 
 
+def public_or_owner(entry, user_id):
+    """A community action is allowed only on public entries (or by the owner).
+    Prevents interacting with someone else's private idea via ID enumeration."""
+    return entry.visibility == 'public' or entry.user_id == user_id
+
+
 @app.route('/api/community/<entry_id>/comments', methods=['POST'])
+@limiter.limit("20 per minute")
 @auth_required
 def post_comment(entry_id):
     """Post a comment on a public entry."""
     try:
         entry = CatalogEntry.query.get(entry_id)
-        if not entry:
+        if not entry or not public_or_owner(entry, g.user_id):
             return jsonify({"error": "Entry not found"}), 404
 
         data = request.json
@@ -1710,6 +1747,19 @@ def post_comment(entry_id):
         )
         db.session.add(comment)
         db.session.commit()
+
+        # Notify the idea owner (not on self-comments).
+        if entry.user_id != g.user_id:
+            notif = Notification(
+                id=str(uuid.uuid4()),
+                user_id=entry.user_id,
+                type='comment',
+                title=f"{g.user_name or g.user_email.split('@')[0]} commented on your idea",
+                message=content[:120],
+                link=f'/community?post={entry_id}',
+            )
+            db.session.add(notif)
+            db.session.commit()
 
         author = User.query.get(g.user_id)
         return jsonify({
@@ -1730,6 +1780,7 @@ def post_comment(entry_id):
 # ---- Views ----
 
 @app.route('/api/community/<entry_id>/view', methods=['POST'])
+@limiter.limit("120 per minute")
 def increment_view(entry_id):
     """Atomically bump a public entry's view_count. Anonymous — no auth needed.
     Makes the 'popular' feed sort meaningful (view_count was never incremented)."""
@@ -1755,7 +1806,7 @@ def toggle_like(entry_id):
     """Toggle like on a public entry."""
     try:
         entry = CatalogEntry.query.get(entry_id)
-        if not entry:
+        if not entry or not public_or_owner(entry, g.user_id):
             return jsonify({"error": "Entry not found"}), 404
 
         existing = Like.query.filter_by(catalog_entry_id=entry_id, user_id=g.user_id).first()
@@ -1780,7 +1831,7 @@ def toggle_bookmark(entry_id):
     """Toggle bookmark on an entry."""
     try:
         entry = CatalogEntry.query.get(entry_id)
-        if not entry:
+        if not entry or not public_or_owner(entry, g.user_id):
             return jsonify({"error": "Entry not found"}), 404
 
         existing = Bookmark.query.filter_by(catalog_entry_id=entry_id, user_id=g.user_id).first()
@@ -2035,7 +2086,7 @@ def toggle_reaction(entry_id):
     """Toggle a reaction on a public entry. Body: {reaction_type: 'brilliant'}"""
     try:
         entry = CatalogEntry.query.get(entry_id)
-        if not entry:
+        if not entry or not public_or_owner(entry, g.user_id):
             return jsonify({"error": "Entry not found"}), 404
 
         data = request.json or {}
@@ -2103,7 +2154,7 @@ def send_connect_request(entry_id):
     """Send a collaboration request. Body: {role: 'developer', message: '...'}"""
     try:
         entry = CatalogEntry.query.get(entry_id)
-        if not entry:
+        if not entry or entry.visibility != 'public':
             return jsonify({"error": "Entry not found"}), 404
         if entry.user_id == g.user_id:
             return jsonify({"error": "Cannot connect with your own idea"}), 400

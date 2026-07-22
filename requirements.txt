@@ -7,6 +7,7 @@ gunicorn==23.0.0
 psycopg2-binary==2.9.10
 cachetools==5.5.0
 PyJWT==2.10.1
+Flask-Limiter==3.8.0
 
 # Optional vector search (only when ENABLE_VECTOR_SEARCH=true).
 # Heavy deps (torch, numpy, model downloads) that bloat the image and slow
