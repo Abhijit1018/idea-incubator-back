@@ -136,6 +136,7 @@ def init_db():
         try:
             db.create_all()
             test_db_connection()
+            run_migrations()
             create_indexes()
             print("Database initialized OK", file=sys.stderr)
             return
@@ -162,6 +163,26 @@ _INDEX_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS ix_notifications_user ON notifications (user_id, is_read)",
     "CREATE INDEX IF NOT EXISTS ix_collab_user ON collaborators (user_id)",
 ]
+
+
+# Lightweight additive migrations for columns that db.create_all() won't add to
+# existing tables. Postgres only (supports ADD COLUMN IF NOT EXISTS); fresh sqlite
+# dev DBs already include the column via create_all().
+_MIGRATION_STATEMENTS = [
+    "ALTER TABLE catalog_entries ADD COLUMN IF NOT EXISTS remixed_from VARCHAR(36)",
+]
+
+
+def run_migrations():
+    if db.engine.name != 'postgresql':
+        return
+    for stmt in _MIGRATION_STATEMENTS:
+        try:
+            db.session.execute(db.text(stmt))
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            print(f"Migration skipped ({stmt}): {e}", file=sys.stderr)
 
 
 def create_indexes():
@@ -325,6 +346,54 @@ def root_status():
         "timestamp": datetime.utcnow().isoformat(),
         "docs_hint": "Use /api/catalogs/ or /api/community/feed"
     }), 200
+
+
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'https://mindinspo.netlify.app').rstrip('/')
+
+
+@app.route('/i/<entry_id>')
+def share_idea(entry_id):
+    """Crawler-friendly share page: renders Open Graph tags so links unfurl on
+    social platforms (which don't run JS), then redirects humans to the SPA."""
+    from flask import Response
+    from markupsafe import escape
+
+    entry = CatalogEntry.query.get(entry_id)
+    target = f"{FRONTEND_URL}/idea/{entry_id}"
+
+    if not entry or entry.visibility != 'public':
+        return Response(
+            f'<!doctype html><meta http-equiv="refresh" content="0;url={escape(FRONTEND_URL)}/community">',
+            mimetype='text/html')
+
+    title = (entry.raw_input or 'An idea on MindInspo')[:90]
+    desc = ((entry.summary or 'AI-researched idea breakdown — summary, tech stack, pros & cons, and more.')
+            .replace('\n', ' '))[:200]
+    image = entry.image_url or f"{FRONTEND_URL}/hero-bg.png"
+
+    html = f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{escape(title)} · MindInspo</title>
+<meta name="description" content="{escape(desc)}">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="MindInspo">
+<meta property="og:title" content="{escape(title)}">
+<meta property="og:description" content="{escape(desc)}">
+<meta property="og:image" content="{escape(image)}">
+<meta property="og:url" content="{escape(target)}">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{escape(title)}">
+<meta name="twitter:description" content="{escape(desc)}">
+<meta name="twitter:image" content="{escape(image)}">
+<meta http-equiv="refresh" content="0;url={escape(target)}">
+<link rel="canonical" href="{escape(target)}">
+</head><body>
+<p>Redirecting to <a href="{escape(target)}">{escape(title)}</a>…</p>
+<script>window.location.replace({json.dumps(target)});</script>
+</body></html>"""
+    return Response(html, mimetype='text/html')
 
 @app.route('/healthz', methods=['GET'])
 def healthz():
@@ -1260,6 +1329,7 @@ def serialize_entries_batch(entries, user_id=None):
             "view_count": getattr(e, 'view_count', 0),
             "tags": getattr(e, 'tags', None),
             "visible_fields": getattr(e, 'visible_fields', None),
+            "remixed_from": getattr(e, 'remixed_from', None),
             "created_at": e.created_at.isoformat(),
             "updated_at": e.updated_at.isoformat() if getattr(e, 'updated_at', None) else None,
             "like_count": like_counts.get(e.id, 0),
@@ -1320,6 +1390,7 @@ def serialize_entry(e, user_id=None):
         "view_count": getattr(e, 'view_count', 0),
         "tags": getattr(e, 'tags', None),
         "visible_fields": getattr(e, 'visible_fields', None),
+        "remixed_from": getattr(e, 'remixed_from', None),
         "created_at": e.created_at.isoformat(),
         "updated_at": e.updated_at.isoformat() if getattr(e, 'updated_at', None) else None,
     }
@@ -1453,6 +1524,95 @@ def community_feed():
         print(f"Error in community feed: {e}")
         return jsonify({"error": str(e)}), 500
 
+
+@app.route('/api/community/entry/<entry_id>', methods=['GET'])
+def get_public_entry(entry_id):
+    """Fetch a single public entry for the shareable idea page. Bumps view_count.
+    The owner may also fetch their own entry even if private (for preview)."""
+    try:
+        entry = CatalogEntry.query.get(entry_id)
+        if not entry:
+            return jsonify({"error": "Entry not found"}), 404
+
+        viewer_id = None
+        auth_header = request.headers.get('Authorization', '')
+        if auth_header.startswith('Bearer '):
+            su = verify_supabase_token(auth_header[7:])
+            if su:
+                viewer_id = su.get('id')
+
+        if entry.visibility != 'public' and entry.user_id != viewer_id:
+            return jsonify({"error": "Entry not found"}), 404
+
+        # Count a view for public entries viewed by non-owners.
+        if entry.visibility == 'public' and entry.user_id != viewer_id:
+            try:
+                CatalogEntry.query.filter_by(id=entry_id).update(
+                    {CatalogEntry.view_count: (db.func.coalesce(CatalogEntry.view_count, 0) + 1)},
+                    synchronize_session=False)
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+
+        return jsonify(serialize_entry(entry, viewer_id)), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/catalogs/<entry_id>/remix', methods=['POST'])
+@limiter.limit("20 per hour")
+@auth_required
+def remix_entry(entry_id):
+    """Fork a public idea into the current user's catalog as a new private draft."""
+    try:
+        source = CatalogEntry.query.get(entry_id)
+        if not source or source.visibility != 'public':
+            return jsonify({"error": "Entry not found"}), 404
+        if source.user_id == g.user_id:
+            return jsonify({"error": "You can't remix your own idea"}), 400
+
+        new_id = str(uuid.uuid4())
+        clone = CatalogEntry(
+            id=new_id,
+            user_id=g.user_id,
+            raw_input=source.raw_input,
+            input_type=source.input_type,
+            status='completed',            # content is already generated; copy as-is
+            summary=source.summary,
+            tech_stack=source.tech_stack,
+            pros_cons=source.pros_cons,
+            similar_tools=source.similar_tools,
+            mermaid_syntax=source.mermaid_syntax,
+            image_url=source.image_url,
+            creator=source.creator,
+            link=source.link,
+            installation=source.installation,
+            unique_features=source.unique_features,
+            market_trend=source.market_trend,
+            tags=source.tags,
+            visibility='private',          # remix lands as a private draft
+            remixed_from=source.id,
+        )
+        db.session.add(clone)
+        db.session.commit()
+
+        # Notify the original author that their idea was remixed.
+        if source.user_id != g.user_id:
+            notif = Notification(
+                id=str(uuid.uuid4()),
+                user_id=source.user_id,
+                type='remix',
+                title=f"{g.user_name or g.user_email.split('@')[0]} remixed your idea",
+                message=source.raw_input[:100],
+                link=f'/community?post={source.id}',
+            )
+            db.session.add(notif)
+            db.session.commit()
+
+        return jsonify({"status": "remixed", "entry": serialize_entry(clone, g.user_id)}), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/api/community/leaderboard', methods=['GET'])

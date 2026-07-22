@@ -44,6 +44,7 @@ class CatalogEntry(db.Model):
     view_count = db.Column(db.Integer, default=0)
     tags = db.Column(db.JSON, nullable=True)
     visible_fields = db.Column(db.JSON, nullable=True)  # List of field names visible when published; null = show all
+    remixed_from = db.Column(db.String(36), nullable=True)  # source entry id when this was forked/remixed
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
