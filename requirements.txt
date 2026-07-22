@@ -3,9 +3,15 @@ Flask-Cors==6.0.2
 Flask-SQLAlchemy==3.1.1
 python-dotenv==1.1.1
 requests==2.32.5
-pinecone==7.3.0
-sentence-transformers==5.1.1
-numpy==2.3.3
 gunicorn==23.0.0
 psycopg2-binary==2.9.10
 cachetools==5.5.0
+PyJWT==2.10.1
+
+# Optional vector search (only when ENABLE_VECTOR_SEARCH=true).
+# Heavy deps (torch, numpy, model downloads) that bloat the image and slow
+# builds/cold starts, so they are kept out of the default install.
+# To enable: uncomment below and set ENABLE_VECTOR_SEARCH=true.
+# pinecone==7.3.0
+# sentence-transformers==5.1.1
+# numpy==2.3.3

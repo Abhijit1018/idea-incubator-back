@@ -135,37 +135,74 @@ BACKEND_BASE_URL = os.getenv('BACKEND_BASE_URL', '').rstrip('/')
 # Supabase Auth config
 SUPABASE_URL = os.getenv('SUPABASE_URL', 'https://vwuwrvxlcykurihjagcp.supabase.co')
 SUPABASE_ANON_KEY = os.getenv('SUPABASE_ANON_KEY', '')
+# HS256 JWT secret from Supabase (Project Settings > API > JWT Secret).
+# When set, tokens are verified locally (no network round-trip per request).
+SUPABASE_JWT_SECRET = os.getenv('SUPABASE_JWT_SECRET', '')
 
-# Simple in-memory cache for auth tokens (token -> {user, expires_at})
-_auth_cache = {}
-_AUTH_CACHE_TTL = 300  # 5 minutes
+try:
+    import jwt as _pyjwt
+except Exception:
+    _pyjwt = None
+
+# Bounded, self-expiring cache (token -> user dict). Avoids unbounded growth.
+from cachetools import TTLCache as _TTLCache
+_auth_cache = _TTLCache(maxsize=5000, ttl=300)  # 5 minutes
+
+
+def _verify_jwt_local(token):
+    """Verify a Supabase JWT locally with the shared HS256 secret. Fast, no network."""
+    if not (_pyjwt and SUPABASE_JWT_SECRET):
+        return None
+    try:
+        payload = _pyjwt.decode(
+            token,
+            SUPABASE_JWT_SECRET,
+            algorithms=['HS256'],
+            audience='authenticated',
+            options={'verify_aud': False},
+        )
+        uid = payload.get('sub')
+        if not uid:
+            return None
+        # Shape it like the /auth/v1/user response the rest of the code expects.
+        return {
+            'id': uid,
+            'email': payload.get('email', ''),
+            'user_metadata': payload.get('user_metadata', {}),
+        }
+    except Exception as e:
+        print(f"Local JWT verify failed: {e}")
+        return None
 
 
 def verify_supabase_token(token):
-    """Verify a Supabase JWT by calling the Supabase Auth API. Results are cached."""
-    now = time.time()
-
-    # Check cache first
+    """Verify a Supabase JWT. Prefers local HS256 verify; falls back to Supabase API. Cached."""
     cached = _auth_cache.get(token)
-    if cached and cached['expires_at'] > now:
-        return cached['user']
+    if cached is not None:
+        return cached
 
-    try:
-        resp = http_requests.get(
-            f"{SUPABASE_URL}/auth/v1/user",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "apikey": SUPABASE_ANON_KEY
-            },
-            timeout=5.0
-        )
-        if resp.status_code == 200:
-            user_data = resp.json()
-            _auth_cache[token] = {'user': user_data, 'expires_at': now + _AUTH_CACHE_TTL}
-            return user_data
-    except Exception as e:
-        print(f"Supabase auth verification error: {e}")
-    return None
+    # 1) Fast path: verify signature locally.
+    user_data = _verify_jwt_local(token)
+
+    # 2) Fallback: ask Supabase (used when JWT secret not configured).
+    if user_data is None:
+        try:
+            resp = http_requests.get(
+                f"{SUPABASE_URL}/auth/v1/user",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "apikey": SUPABASE_ANON_KEY
+                },
+                timeout=5.0
+            )
+            if resp.status_code == 200:
+                user_data = resp.json()
+        except Exception as e:
+            print(f"Supabase auth verification error: {e}")
+
+    if user_data is not None:
+        _auth_cache[token] = user_data
+    return user_data
 
 
 def auth_required(f):
@@ -233,6 +270,20 @@ def root_status():
 @app.route('/healthz', methods=['GET'])
 def healthz():
     return jsonify({"status": "ok"}), 200
+
+
+@app.route('/api/keepalive', methods=['GET'])
+def keepalive():
+    """Warm path for the uptime cron: keeps Render awake AND runs a trivial
+    query so Supabase does not auto-pause the project from inactivity."""
+    db_ok = False
+    try:
+        db.session.execute(db.text('SELECT 1'))
+        db_ok = True
+    except Exception as e:
+        db.session.rollback()
+        print(f"Keepalive DB ping failed: {e}", file=sys.stderr)
+    return jsonify({"status": "ok", "db": db_ok, "ts": datetime.utcnow().isoformat()}), 200
 
 @app.route('/api/stats', methods=['GET'])
 def public_stats():
@@ -605,20 +656,14 @@ def send_chat_message(entry_id):
         
         if not message_text:
             return jsonify({"error": "message is required"}), 400
-        
-        # Get or create user - handle both frontend user and n8n AI assistant
-        db_user = None
-        if user_id:
-            db_user = User.query.filter_by(id=user_id).first()
-        
+
+        # Require a real, existing user — never silently attribute to a random account.
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
+        db_user = User.query.filter_by(id=user_id).first()
         if not db_user:
-            # Use default user if not found
-            db_user = User.query.first()
-            if not db_user:
-                db_user = User(email="demo@ideaincubator.local")
-                db.session.add(db_user)
-                db.session.commit()
-        
+            return jsonify({"error": "Unknown user_id"}), 400
+
         # Verify catalog entry exists
         entry = CatalogEntry.query.get(entry_id)
         if not entry:
@@ -849,24 +894,11 @@ def chat_message_webhook():
         if not entry_id or not user_message:
             return jsonify({"error": "entry_id and message are required", "received": data}), 400
         
-        # Get or create user - ensure we always have a valid user_id from the users table
-        db_user = None
-        
-        # First try to find the user by provided id
-        if user_id:
-            db_user = User.query.filter_by(id=user_id).first()
-        
-        # If not found or no user_id provided, get or create default user
+        # user_id comes from the verified token (auth_required syncs the user row),
+        # so it is always a real account. No random-user fallback.
+        db_user = User.query.filter_by(id=user_id).first()
         if not db_user:
-            db_user = User.query.first()
-            if not db_user:
-                # Create default user
-                db_user = User(email="demo@ideaincubator.local")
-                db.session.add(db_user)
-                db.session.commit()
-                print(f"[chat-message webhook] Created default user: {db_user.id}")
-        
-        print(f"[chat-message webhook] Using user_id: {db_user.id}")
+            return jsonify({"error": "Authenticated user not found"}), 401
         
         # Store user message with valid user_id
         try:
@@ -2227,26 +2259,20 @@ def remove_collaborator(entry_id, user_id):
         if not collab:
             return jsonify({"error": "Collaborator not found"}), 404
             
-        collab_name = collab.user.name or 'A collaborator'
         db.session.delete(collab)
-        
-        # Also add a system message to the chat
-        try:
-            sys_msg = ChatMessage(
-                entry_id=entry_id,
-                user_id=None,
-                message=f"SYSTEM_MESSAGE::info::{collab_name} was removed from the team by the owner.",
-                is_user=False
-            )
-            db.session.add(sys_msg)
-        except Exception as e:
-            print(f"Failed to add removal system message: {e}")
+
+        # Notify the removed user (in-app notification)
+        notif = Notification(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            type='info',
+            title="You were removed from a project team",
+            message=f"For: {entry.raw_input[:100]}",
+            link='/dashboard',
+        )
+        db.session.add(notif)
 
         db.session.commit()
-        
-        # Notify the user who was removed
-        add_notification(user_id, f"You have been removed from the team for project '{entry.raw_input}'", "info")
-        
         return jsonify({"status": "ok"}), 200
     except Exception as e:
         db.session.rollback()
