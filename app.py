@@ -111,11 +111,45 @@ def init_db():
         try:
             db.create_all()
             test_db_connection()
+            create_indexes()
             print("Database initialized OK", file=sys.stderr)
             return
         except Exception as e:
             print(f"DB init attempt {attempt}/5 failed: {e}", file=sys.stderr)
             _time.sleep(2)
+
+
+# Indexes that db.create_all() won't add to pre-existing tables. Created idempotently
+# on Postgres to speed up the feed, per-user catalog lookups, and the batched
+# reaction/comment/bookmark count queries (which filter by catalog_entry_id).
+_INDEX_STATEMENTS = [
+    "CREATE INDEX IF NOT EXISTS ix_catalog_user ON catalog_entries (user_id)",
+    "CREATE INDEX IF NOT EXISTS ix_catalog_feed ON catalog_entries (visibility, status, published_at DESC)",
+    "CREATE INDEX IF NOT EXISTS ix_likes_entry ON likes (catalog_entry_id)",
+    "CREATE INDEX IF NOT EXISTS ix_comments_entry ON comments (catalog_entry_id)",
+    "CREATE INDEX IF NOT EXISTS ix_bookmarks_entry ON bookmarks (catalog_entry_id)",
+    "CREATE INDEX IF NOT EXISTS ix_reactions_entry ON reactions (catalog_entry_id)",
+    "CREATE INDEX IF NOT EXISTS ix_updates_entry ON idea_updates (catalog_entry_id)",
+    "CREATE INDEX IF NOT EXISTS ix_connect_entry ON connect_requests (catalog_entry_id)",
+    "CREATE INDEX IF NOT EXISTS ix_connect_owner ON connect_requests (owner_id)",
+    "CREATE INDEX IF NOT EXISTS ix_connect_requester ON connect_requests (requester_id)",
+    "CREATE INDEX IF NOT EXISTS ix_chat_entry ON chat_messages (catalog_entry_id)",
+    "CREATE INDEX IF NOT EXISTS ix_notifications_user ON notifications (user_id, is_read)",
+    "CREATE INDEX IF NOT EXISTS ix_collab_user ON collaborators (user_id)",
+]
+
+
+def create_indexes():
+    """Create performance indexes if missing. Postgres only; no-ops elsewhere."""
+    if db.engine.name != 'postgresql':
+        return
+    for stmt in _INDEX_STATEMENTS:
+        try:
+            db.session.execute(db.text(stmt))
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            print(f"Index create skipped ({stmt}): {e}", file=sys.stderr)
 
 
 # Test database connection
@@ -775,93 +809,83 @@ def generate_catalog_embedding(entry_id):
         return jsonify({"status": "error", "message": str(e)}), 400
 
 
+def _entry_searchable():
+    """Concatenated searchable text for a CatalogEntry (nulls skipped)."""
+    return db.func.concat_ws(
+        ' ',
+        CatalogEntry.raw_input,
+        CatalogEntry.summary,
+        CatalogEntry.creator,
+        CatalogEntry.market_trend,
+        db.cast(CatalogEntry.tech_stack, db.String),
+        db.cast(CatalogEntry.similar_tools, db.String),
+        db.cast(CatalogEntry.tags, db.String),
+    )
+
+
+def apply_search(query, query_text):
+    """Apply relevance search to a CatalogEntry query.
+
+    Postgres: full-text search with stemming + ts_rank ordering (typo-tolerant to
+    word forms, ranked by relevance). Other engines (sqlite dev): multi-term ILIKE
+    where every term must appear somewhere. Returns (query, is_ranked).
+    """
+    query_text = (query_text or '').strip()
+    if not query_text:
+        return query, False
+
+    if db.engine.name == 'postgresql':
+        searchable = _entry_searchable()
+        ts = db.func.to_tsvector('english', searchable)
+        tsq = db.func.plainto_tsquery('english', query_text)
+        ranked = query.filter(ts.op('@@')(tsq)).order_by(db.func.ts_rank(ts, tsq).desc())
+        return ranked, True
+
+    # Fallback (sqlite/local): AND of per-term ILIKE across key fields.
+    for term in query_text.split():
+        like = f'%{term}%'
+        query = query.filter(db.or_(
+            CatalogEntry.raw_input.ilike(like),
+            CatalogEntry.summary.ilike(like),
+            CatalogEntry.creator.ilike(like),
+            db.cast(CatalogEntry.tech_stack, db.String).ilike(like),
+        ))
+    return query, False
+
+
 @app.route('/api/catalogs/search', methods=['POST'])
 @auth_required
 def search_catalogs():
-    """Search catalog entries using vector similarity with Pinecone"""
+    """Search the current user's catalog entries (Postgres full-text, ranked)."""
     try:
-        data = request.json
-        query_text = data.get('query')
-        limit = data.get('limit', 10)
-        
+        data = request.json or {}
+        query_text = (data.get('query') or '').strip()
+        limit = min(int(data.get('limit', 10) or 10), 50)
+
         if not query_text:
             return jsonify({"error": "query is required"}), 400
-        
-        if not ENABLE_VECTOR_SEARCH or not embedding_model:
+
+        base = CatalogEntry.query.filter(CatalogEntry.user_id == g.user_id)
+        searched, ranked = apply_search(base, query_text)
+        try:
+            entries = searched.limit(limit).all()
+        except Exception as e:
+            # FTS not available for some reason — degrade to simple ILIKE.
+            db.session.rollback()
+            print(f"Search FTS failed, falling back to ILIKE: {e}")
+            like = f'%{query_text}%'
             entries = CatalogEntry.query.filter(
                 CatalogEntry.user_id == g.user_id,
                 db.or_(
-                    CatalogEntry.raw_input.ilike(f'%{query_text}%'),
-                    CatalogEntry.summary.ilike(f'%{query_text}%'),
-                    CatalogEntry.tech_stack.cast(db.String).ilike(f'%{query_text}%'),
-                    CatalogEntry.creator.ilike(f'%{query_text}%')
+                    CatalogEntry.raw_input.ilike(like),
+                    CatalogEntry.summary.ilike(like),
                 )
             ).limit(limit).all()
 
-            result = serialize_entries_batch(entries, g.user_id)
-            return jsonify(result), 200
-
-        # Generate embedding for query text using SentenceTransformer
-        try:
-            query_embedding = embedding_model.encode(query_text).tolist()
-        except Exception as e:
-            print(f"Error generating query embedding: {e}")
-            return jsonify({"error": "Failed to generate query embedding"}), 500
-        
-        # Search in Pinecone when configured.
-        try:
-            if not index:
-                raise RuntimeError("Pinecone index not configured")
-
-            search_results = index.query(
-                vector=query_embedding,
-                top_k=limit,
-                include_metadata=True
-            )
-            
-            # Get entry IDs from results and fetch full entries from PostgreSQL
-            entry_ids = [match['id'] for match in search_results['matches']]
-            
-            # If Pinecone returns results, use them; otherwise fall back to text search
-            if entry_ids:
-                entries = CatalogEntry.query.filter(
-                    CatalogEntry.id.in_(entry_ids),
-                    CatalogEntry.user_id == g.user_id
-                ).all()
-                # Order by search relevance (Pinecone returns results sorted by score)
-                entry_dict = {entry.id: entry for entry in entries}
-                ordered_entries = [entry_dict[eid] for eid in entry_ids if eid in entry_dict]
-            else:
-                # No Pinecone results - fall back to text search
-                print("No Pinecone results, falling back to text search...")
-                entries = CatalogEntry.query.filter(
-                    CatalogEntry.user_id == g.user_id,
-                    db.or_(
-                        CatalogEntry.raw_input.ilike(f'%{query_text}%'),
-                        CatalogEntry.summary.ilike(f'%{query_text}%'),
-                        CatalogEntry.tech_stack.cast(db.String).ilike(f'%{query_text}%'),
-                        CatalogEntry.creator.ilike(f'%{query_text}%')
-                    )
-                ).limit(limit).all()
-                ordered_entries = entries
-                print(f"Text search returned {len(ordered_entries)} results")
-            
-            result = serialize_entries_batch(ordered_entries, g.user_id)
-            return jsonify(result), 200
-        except Exception as e:
-            print(f"Error querying Pinecone: {e}")
-            # Fallback to text-based search if needed
-            entries = CatalogEntry.query.filter(
-                CatalogEntry.user_id == g.user_id,
-                db.or_(
-                    CatalogEntry.raw_input.ilike(f'%{query_text}%'),
-                    CatalogEntry.summary.ilike(f'%{query_text}%')
-                )
-            ).limit(limit).all()
-            
-            result = serialize_entries_batch(entries, g.user_id)
-            return jsonify(result), 200
+        result = serialize_entries_batch(entries, g.user_id)
+        return jsonify(result), 200
     except Exception as e:
+        db.session.rollback()
         return jsonify({"status": "error", "message": str(e)}), 400
 
 
@@ -1355,20 +1379,17 @@ def community_feed():
         if filter_type != 'all':
             query = query.filter(CatalogEntry.input_type == filter_type)
 
+        ranked = False
         if search:
-            query = query.filter(
-                db.or_(
-                    CatalogEntry.raw_input.ilike(f'%{search}%'),
-                    CatalogEntry.summary.ilike(f'%{search}%'),
-                )
-            )
+            query, ranked = apply_search(query, search)
 
-        if sort == 'popular':
-            query = query.order_by(CatalogEntry.view_count.desc(), CatalogEntry.published_at.desc())
-        elif sort == 'trending':
-            # Trending is handled post-query via idea_score
+        if ranked:
+            # Relevance ordering already applied by apply_search; recency as tiebreak.
             query = query.order_by(CatalogEntry.published_at.desc())
+        elif sort == 'popular':
+            query = query.order_by(CatalogEntry.view_count.desc(), CatalogEntry.published_at.desc())
         else:
+            # 'trending' is re-sorted post-query via idea_score; default is recency.
             query = query.order_by(CatalogEntry.published_at.desc())
             
         t1 = time.time()
@@ -1706,6 +1727,26 @@ def post_comment(entry_id):
         return jsonify({"error": str(e)}), 500
 
 
+# ---- Views ----
+
+@app.route('/api/community/<entry_id>/view', methods=['POST'])
+def increment_view(entry_id):
+    """Atomically bump a public entry's view_count. Anonymous — no auth needed.
+    Makes the 'popular' feed sort meaningful (view_count was never incremented)."""
+    try:
+        updated = CatalogEntry.query.filter_by(
+            id=entry_id, visibility='public'
+        ).update(
+            {CatalogEntry.view_count: (db.func.coalesce(CatalogEntry.view_count, 0) + 1)},
+            synchronize_session=False
+        )
+        db.session.commit()
+        return jsonify({"ok": bool(updated)}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
 # ---- Likes ----
 
 @app.route('/api/community/<entry_id>/like', methods=['POST'])
@@ -1792,9 +1833,46 @@ def get_public_profile(user_id):
         
         # Get published ideas by this user
         ideas = CatalogEntry.query.filter_by(user_id=user_id, visibility='public').order_by(CatalogEntry.created_at.desc()).all()
+        entry_ids = [i.id for i in ideas]
+
+        # Batch all per-idea aggregates in a handful of queries (was ~9 per idea).
+        reaction_map = {}   # eid -> {rtype: count}
+        comment_counts = {}
+        bookmark_counts = {}
+        update_counts = {}
+        latest_updates = {}  # eid -> IdeaUpdate (most recent)
+        if entry_ids:
+            for eid, rtype, cnt in db.session.query(
+                Reaction.catalog_entry_id, Reaction.reaction_type, db.func.count(Reaction.id)
+            ).filter(Reaction.catalog_entry_id.in_(entry_ids)).group_by(
+                Reaction.catalog_entry_id, Reaction.reaction_type).all():
+                reaction_map.setdefault(eid, {})[rtype] = cnt
+            comment_counts = dict(db.session.query(
+                Comment.catalog_entry_id, db.func.count(Comment.id)
+            ).filter(Comment.catalog_entry_id.in_(entry_ids)).group_by(Comment.catalog_entry_id).all())
+            bookmark_counts = dict(db.session.query(
+                Bookmark.catalog_entry_id, db.func.count(Bookmark.id)
+            ).filter(Bookmark.catalog_entry_id.in_(entry_ids)).group_by(Bookmark.catalog_entry_id).all())
+            update_counts = dict(db.session.query(
+                IdeaUpdate.catalog_entry_id, db.func.count(IdeaUpdate.id)
+            ).filter(IdeaUpdate.catalog_entry_id.in_(entry_ids)).group_by(IdeaUpdate.catalog_entry_id).all())
+            # Newest-first; first row seen per entry is its latest update.
+            for u in IdeaUpdate.query.filter(IdeaUpdate.catalog_entry_id.in_(entry_ids)).order_by(
+                    IdeaUpdate.created_at.desc()).all():
+                latest_updates.setdefault(u.catalog_entry_id, u)
+
+        weights = {'brilliant': 3, 'interested': 1, 'sellable': 4, 'build_worthy': 3, 'needs_work': 0.5}
+
+        def score_for(eid):
+            rmap = reaction_map.get(eid, {})
+            s = sum(rmap.get(rt, 0) * w for rt, w in weights.items())
+            s += comment_counts.get(eid, 0) * 2
+            s += bookmark_counts.get(eid, 0) * 1.5
+            return round(s, 1)
+
         ideas_data = []
         for idea in ideas:
-            latest_update = IdeaUpdate.query.filter_by(catalog_entry_id=idea.id).order_by(IdeaUpdate.created_at.desc()).first()
+            latest_update = latest_updates.get(idea.id)
             ideas_data.append({
                 "id": idea.id,
                 "raw_input": idea.raw_input,
@@ -1802,8 +1880,8 @@ def get_public_profile(user_id):
                 "summary": idea.summary,
                 "image_url": idea.image_url,
                 "tech_stack": idea.tech_stack,
-                "idea_score": compute_idea_score(idea.id),
-                "updates_count": IdeaUpdate.query.filter_by(catalog_entry_id=idea.id).count(),
+                "idea_score": score_for(idea.id),
+                "updates_count": update_counts.get(idea.id, 0),
                 "latest_update": {
                     "content": latest_update.content,
                     "update_type": latest_update.update_type,
@@ -1812,16 +1890,11 @@ def get_public_profile(user_id):
                 "created_at": idea.created_at.isoformat()
             })
 
-        # Calculate total reactions received on all public ideas
+        # Total reactions across the user's public ideas — summed from the batched map.
         total_reactions = {}
-        for rtype in REACTION_TYPES:
-            count = Reaction.query.join(CatalogEntry).filter(
-                CatalogEntry.user_id == user_id, 
-                Reaction.reaction_type == rtype,
-                CatalogEntry.visibility == 'public'
-            ).count()
-            if count > 0:
-                total_reactions[rtype] = count
+        for rmap in reaction_map.values():
+            for rtype, cnt in rmap.items():
+                total_reactions[rtype] = total_reactions.get(rtype, 0) + cnt
 
         return jsonify({
             "id": user.id,
