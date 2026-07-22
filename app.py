@@ -1123,6 +1123,70 @@ def apply_chat_edit(entry_id):
         return jsonify({"status": "error", "message": str(e)}), 400
 
 
+@app.route('/api/catalogs/<entry_id>/analytics', methods=['GET'])
+@auth_required
+def entry_analytics(entry_id):
+    """Owner-only performance stats for one idea."""
+    try:
+        entry = CatalogEntry.query.get(entry_id)
+        if not entry:
+            return jsonify({"error": "Entry not found"}), 404
+        if entry.user_id != g.user_id:
+            return jsonify({"error": "Unauthorized"}), 403
+
+        reactions = {rt: Reaction.query.filter_by(catalog_entry_id=entry_id, reaction_type=rt).count()
+                     for rt in REACTION_TYPES}
+        return jsonify({
+            "view_count": entry.view_count or 0,
+            "like_count": Like.query.filter_by(catalog_entry_id=entry_id).count(),
+            "comment_count": Comment.query.filter_by(catalog_entry_id=entry_id).count(),
+            "bookmark_count": Bookmark.query.filter_by(catalog_entry_id=entry_id).count(),
+            "connect_count": ConnectRequest.query.filter_by(catalog_entry_id=entry_id).count(),
+            "connect_accepted": ConnectRequest.query.filter_by(catalog_entry_id=entry_id, status='accepted').count(),
+            "updates_count": IdeaUpdate.query.filter_by(catalog_entry_id=entry_id).count(),
+            "remix_count": CatalogEntry.query.filter_by(remixed_from=entry_id).count(),
+            "reactions": reactions,
+            "idea_score": compute_idea_score(entry_id),
+            "visibility": entry.visibility,
+            "status": entry.status,
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/catalogs/<entry_id>/regenerate', methods=['POST'])
+@limiter.limit("10 per hour")
+@auth_required
+def regenerate_entry(entry_id):
+    """Owner-only: re-run the AI pipeline for an idea (recover a failed/stale one
+    or refresh its research). Resets to pending and re-triggers the n8n webhook."""
+    try:
+        entry = CatalogEntry.query.get(entry_id)
+        if not entry:
+            return jsonify({"error": "Entry not found"}), 404
+        if entry.user_id != g.user_id:
+            return jsonify({"error": "Unauthorized"}), 403
+
+        entry.status = 'pending'
+        entry.retry_count = 0
+        entry.updated_at = datetime.utcnow()
+        db.session.commit()
+
+        try:
+            http_requests.post(N8N_WEBHOOK_URL, json={
+                "entry_id": entry.id,
+                "raw_input": entry.raw_input,
+                "input_type": entry.input_type,
+            }, timeout=5.0)
+        except http_requests.exceptions.RequestException as e:
+            print(f"Regenerate webhook error: {e}")
+
+        return jsonify({"status": "pending", "entry_id": entry.id}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/catalogs/<entry_id>', methods=['PUT'])
 @auth_required
 def update_catalog_entry(entry_id):
