@@ -60,8 +60,15 @@ def normalize_database_url(database_url):
     return database_url
 
 cors_origins_raw = os.getenv('CORS_ALLOWED_ORIGINS', '').strip()
-if cors_origins_raw:
-    cors_origins = [origin.strip() for origin in cors_origins_raw.split(',') if origin.strip()]
+cors_origins = [o.strip().rstrip('/') for o in cors_origins_raw.split(',') if o.strip()]
+
+# Always allow the configured frontend origin, so FRONTEND_URL alone is enough
+# (no need to keep CORS_ALLOWED_ORIGINS in sync with it).
+_frontend_origin = os.getenv('FRONTEND_URL', '').strip().rstrip('/')
+if _frontend_origin and _frontend_origin not in cors_origins:
+    cors_origins.append(_frontend_origin)
+
+if cors_origins:
     CORS(app, resources={r"/api/*": {"origins": cors_origins, "allow_headers": ["Authorization", "Content-Type"]}})
 else:
     CORS(app, resources={r"/api/*": {"origins": "*", "allow_headers": ["Authorization", "Content-Type"]}})
