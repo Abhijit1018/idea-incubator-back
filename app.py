@@ -146,6 +146,7 @@ def init_db():
             run_migrations()
             create_indexes()
             harden_rls()
+            setup_realtime_policies()
             print("Database initialized OK", file=sys.stderr)
             return
         except Exception as e:
@@ -243,6 +244,53 @@ def harden_rls():
                 db.session.commit()
             except Exception:
                 db.session.rollback()
+
+
+# Scoped RLS SELECT policies so Supabase Realtime delivers workspace changes to
+# the owner/collaborators of a project (and no one else). The membership check
+# lives in a SECURITY DEFINER function so it can read catalog_entries/collaborators
+# even though those tables are RLS-locked (the function runs as its owner).
+# auth.uid() = the caller's Supabase id = our User.id (can't be spoofed).
+_REALTIME_POLICY_STATEMENTS = [
+    """CREATE OR REPLACE FUNCTION public.is_workspace_member(p_entry_id text, p_uid text)
+       RETURNS boolean LANGUAGE sql SECURITY DEFINER SET search_path = public AS $func$
+         SELECT EXISTS (
+           SELECT 1 FROM catalog_entries e
+           WHERE e.id = p_entry_id
+             AND (e.user_id = p_uid
+                  OR EXISTS (SELECT 1 FROM collaborators c
+                             WHERE c.catalog_entry_id = e.id AND c.user_id = p_uid))
+         );
+       $func$""",
+    "GRANT EXECUTE ON FUNCTION public.is_workspace_member(text, text) TO authenticated",
+    # REPLICA IDENTITY FULL so UPDATE/DELETE events carry catalog_entry_id for the
+    # RLS check (otherwise only the PK is available and the policy can't evaluate).
+    "ALTER TABLE workspace_tasks REPLICA IDENTITY FULL",
+    "DROP POLICY IF EXISTS ws_tasks_read ON workspace_tasks",
+    """CREATE POLICY ws_tasks_read ON workspace_tasks FOR SELECT TO authenticated
+       USING (public.is_workspace_member(catalog_entry_id, (auth.uid())::text))""",
+    "ALTER TABLE workspace_notes REPLICA IDENTITY FULL",
+    "DROP POLICY IF EXISTS ws_notes_read ON workspace_notes",
+    """CREATE POLICY ws_notes_read ON workspace_notes FOR SELECT TO authenticated
+       USING (public.is_workspace_member(catalog_entry_id, (auth.uid())::text))""",
+]
+
+
+def setup_realtime_policies():
+    """Add scoped SELECT policies enabling authenticated owner/collaborators to
+    receive Realtime on the workspace tables. Postgres/Supabase only; each
+    statement is guarded so a missing auth.uid() (non-Supabase) just no-ops."""
+    if db.engine.name != 'postgresql':
+        return
+    if os.getenv('HARDEN_RLS', 'true').lower() != 'true':
+        return
+    for stmt in _REALTIME_POLICY_STATEMENTS:
+        try:
+            db.session.execute(db.text(stmt))
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            print(f"Realtime policy statement skipped: {e}", file=sys.stderr)
 
 
 def create_indexes():
