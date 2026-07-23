@@ -2363,6 +2363,21 @@ def toggle_reaction(entry_id):
         for rtype in REACTION_TYPES:
             reactions_summary[rtype] = Reaction.query.filter_by(catalog_entry_id=entry_id, reaction_type=rtype).count()
 
+        # Milestone notification — fires once, when the total lands exactly on a threshold.
+        if toggled and entry.user_id != g.user_id:
+            total = sum(reactions_summary.values())
+            if total in {5, 10, 25, 50, 100, 250, 500, 1000}:
+                milestone = Notification(
+                    id=str(uuid.uuid4()),
+                    user_id=entry.user_id,
+                    type='milestone',
+                    title=f"🎉 Your idea just hit {total} reactions!",
+                    message=entry.raw_input[:100],
+                    link=f'/community?post={entry_id}',
+                )
+                db.session.add(milestone)
+                db.session.commit()
+
         user_reactions = [r.reaction_type for r in Reaction.query.filter_by(catalog_entry_id=entry_id, user_id=g.user_id).all()]
 
         return jsonify({
@@ -2372,6 +2387,47 @@ def toggle_reaction(entry_id):
             "user_reactions": user_reactions,
         }), 200
     except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/community/<entry_id>/reactions', methods=['GET'])
+def list_reactors(entry_id):
+    """Who reacted, grouped by reaction type (public entries). Capped per type."""
+    try:
+        entry = CatalogEntry.query.get(entry_id)
+        if not entry or entry.visibility != 'public':
+            return jsonify({"error": "Entry not found"}), 404
+
+        rows = db.session.query(Reaction.reaction_type, User) \
+            .join(User, Reaction.user_id == User.id) \
+            .filter(Reaction.catalog_entry_id == entry_id) \
+            .order_by(Reaction.created_at.desc()).all()
+
+        grouped = {rt: [] for rt in REACTION_TYPES}
+        for rtype, u in rows:
+            bucket = grouped.setdefault(rtype, [])
+            if len(bucket) < 30:
+                bucket.append({
+                    "id": u.id,
+                    "name": u.name or (u.email.split('@')[0] if u.email else 'Builder'),
+                    "avatar_url": u.avatar_url,
+                })
+        return jsonify(grouped), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/bookmarks', methods=['GET'])
+@auth_required
+def list_bookmarks():
+    """The current user's bookmarked ideas, newest bookmark first."""
+    try:
+        rows = db.session.query(CatalogEntry).join(
+            Bookmark, Bookmark.catalog_entry_id == CatalogEntry.id
+        ).filter(Bookmark.user_id == g.user_id).order_by(Bookmark.created_at.desc()).all()
+        return jsonify(serialize_entries_batch(rows, g.user_id)), 200
+    except Exception as e:
+        db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
 
