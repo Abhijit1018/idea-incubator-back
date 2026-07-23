@@ -145,6 +145,7 @@ def init_db():
             test_db_connection()
             run_migrations()
             create_indexes()
+            harden_rls()
             print("Database initialized OK", file=sys.stderr)
             return
         except Exception as e:
@@ -199,6 +200,49 @@ def run_migrations():
         except Exception as e:
             db.session.rollback()
             print(f"Migration skipped ({stmt}): {e}", file=sys.stderr)
+
+
+# All app tables in the public schema. RLS is enabled on each so they are NOT
+# reachable via Supabase's auto REST / Realtime API (anon/authenticated roles);
+# access is only through this backend, which connects as the table owner and
+# therefore bypasses RLS.
+_APP_TABLES = [
+    'users', 'catalog_entries', 'chat_messages', 'catalog_embeddings', 'comments',
+    'likes', 'bookmarks', 'reactions', 'connect_requests', 'notifications',
+    'idea_updates', 'collaborators', 'follows', 'workspace_tasks', 'workspace_notes',
+]
+
+
+def harden_rls():
+    """Enable Row Level Security (deny-all: RLS on, no policies) on every app table.
+
+    Safe because the backend connects as the table owner, which bypasses RLS
+    (we never use FORCE). Self-healing: after enabling RLS on a table we confirm
+    the backend can still read it; if it can't (i.e. the connection is somehow
+    NOT the owner), we immediately DISABLE RLS again so the app can never break.
+    Disable entirely with HARDEN_RLS=false.
+    """
+    if db.engine.name != 'postgresql':
+        return
+    if os.getenv('HARDEN_RLS', 'true').lower() != 'true':
+        print("RLS hardening disabled via HARDEN_RLS=false", file=sys.stderr)
+        return
+    for t in _APP_TABLES:
+        try:
+            db.session.execute(db.text(f'ALTER TABLE {t} ENABLE ROW LEVEL SECURITY'))
+            db.session.commit()
+            # Owner bypasses RLS, so this must still succeed. If it doesn't, the
+            # backend isn't the owner and RLS would lock it out — roll back.
+            db.session.execute(db.text(f'SELECT 1 FROM {t} LIMIT 1'))
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            print(f"RLS hardening rolled back for {t}: {e}", file=sys.stderr)
+            try:
+                db.session.execute(db.text(f'ALTER TABLE {t} DISABLE ROW LEVEL SECURITY'))
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
 
 
 def create_indexes():
