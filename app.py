@@ -2336,6 +2336,102 @@ def following_feed():
         return jsonify({"error": str(e)}), 500
 
 
+def _viewer_following_set():
+    """Set of user ids the current request's viewer follows (empty if anon)."""
+    auth_header = request.headers.get('Authorization', '')
+    if auth_header.startswith('Bearer '):
+        su = verify_supabase_token(auth_header[7:])
+        if su:
+            vid = su.get('id')
+            return vid, {f.following_id for f in Follow.query.filter_by(follower_id=vid).all()}
+    return None, set()
+
+
+def _user_card(u, viewer_id, following_set):
+    return {
+        "id": u.id,
+        "name": u.name or (u.email.split('@')[0] if u.email else 'Builder'),
+        "avatar_url": u.avatar_url,
+        "bio": u.bio,
+        "is_following": u.id in following_set,
+        "is_self": u.id == viewer_id,
+    }
+
+
+@app.route('/api/users/<user_id>/following', methods=['GET'])
+def list_following(user_id):
+    """Users that <user_id> follows."""
+    try:
+        viewer_id, following_set = _viewer_following_set()
+        rows = db.session.query(User).join(Follow, Follow.following_id == User.id) \
+            .filter(Follow.follower_id == user_id).order_by(Follow.created_at.desc()).all()
+        return jsonify([_user_card(u, viewer_id, following_set) for u in rows]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/users/<user_id>/followers', methods=['GET'])
+def list_followers(user_id):
+    """Users that follow <user_id>."""
+    try:
+        viewer_id, following_set = _viewer_following_set()
+        rows = db.session.query(User).join(Follow, Follow.follower_id == User.id) \
+            .filter(Follow.following_id == user_id).order_by(Follow.created_at.desc()).all()
+        return jsonify([_user_card(u, viewer_id, following_set) for u in rows]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/collaborations', methods=['GET'])
+@auth_required
+def my_collaborations():
+    """Projects the current user collaborates on, and their own projects that
+    have collaborators — the 'collab' side of the network hub."""
+    try:
+        def entry_card(e, owner=None, role=None, members=None):
+            card = {
+                "id": e.id,
+                "raw_input": e.raw_input,
+                "summary": e.summary,
+                "image_url": e.image_url,
+                "input_type": e.input_type,
+                "visibility": e.visibility,
+            }
+            if owner is not None:
+                card["owner"] = {"id": owner.id, "name": owner.name or owner.email.split('@')[0], "avatar_url": owner.avatar_url}
+            if role is not None:
+                card["role"] = role
+            if members is not None:
+                card["members"] = members
+            return card
+
+        # Projects where I'm a collaborator (someone else's idea).
+        collaborating_on = []
+        rows = db.session.query(CatalogEntry, Collaborator.role, User) \
+            .join(Collaborator, Collaborator.catalog_entry_id == CatalogEntry.id) \
+            .join(User, CatalogEntry.user_id == User.id) \
+            .filter(Collaborator.user_id == g.user_id).all()
+        for e, role, owner in rows:
+            collaborating_on.append(entry_card(e, owner=owner, role=role))
+
+        # My projects that have collaborators.
+        my_entries = CatalogEntry.query.filter_by(user_id=g.user_id).all()
+        my_ids = [e.id for e in my_entries]
+        member_map = {}
+        if my_ids:
+            for eid, u, role in db.session.query(Collaborator.catalog_entry_id, User, Collaborator.role) \
+                    .join(User, Collaborator.user_id == User.id) \
+                    .filter(Collaborator.catalog_entry_id.in_(my_ids)).all():
+                member_map.setdefault(eid, []).append({
+                    "id": u.id, "name": u.name or u.email.split('@')[0], "avatar_url": u.avatar_url, "role": role,
+                })
+        my_projects = [entry_card(e, members=member_map[e.id]) for e in my_entries if e.id in member_map]
+
+        return jsonify({"collaborating_on": collaborating_on, "my_projects": my_projects}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/profile', methods=['PUT'])
 @auth_required
 def update_profile():
