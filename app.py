@@ -1520,9 +1520,10 @@ def community_feed():
     try:
         page = request.args.get('page', 1, type=int)
         per_page = request.args.get('per_page', 20, type=int)
-        sort = request.args.get('sort', 'recent')  # recent | popular
+        sort = request.args.get('sort', 'recent')  # recent | popular | trending
         filter_type = request.args.get('type', 'all')  # all | idea | tool
         search = request.args.get('q', '').strip()
+        tag = request.args.get('tag', '').strip()
 
         # Get user_id if authenticated
         user_id = None
@@ -1534,7 +1535,7 @@ def community_feed():
                 user_id = su.get('id')
 
         # Cache key based on all parameters and user_id (for personalized likes/bookmarks)
-        cache_key = f"feed_{page}_{per_page}_{sort}_{filter_type}_{search}_{user_id}"
+        cache_key = f"feed_{page}_{per_page}_{sort}_{filter_type}_{search}_{tag}_{user_id}"
         if cache_key in feed_cache:
             return jsonify({
                 "entries": feed_cache[cache_key]["entries"],
@@ -1551,9 +1552,40 @@ def community_feed():
         if filter_type != 'all':
             query = query.filter(CatalogEntry.input_type == filter_type)
 
+        if tag:
+            # tags is a JSON array; match by substring on its text form (dialect-safe).
+            query = query.filter(db.cast(CatalogEntry.tags, db.String).ilike(f'%"{tag}"%'))
+
         ranked = False
         if search:
             query, ranked = apply_search(query, search)
+
+        if sort == 'trending' and not ranked:
+            # Proper trending: rank a recent candidate set by a time-decayed score
+            # (HN-style: score / (age_hours + 2)^1.5), then paginate — instead of
+            # only re-sorting one page.
+            since = datetime.utcnow() - timedelta(days=45)
+            candidates = query.filter(
+                CatalogEntry.published_at.isnot(None),
+                CatalogEntry.published_at >= since,
+            ).order_by(CatalogEntry.published_at.desc()).limit(300).all()
+            serialized = serialize_entries_batch(candidates, user_id)
+            now = datetime.utcnow()
+            by_id = {c.id: c for c in candidates}
+
+            def trend_score(d):
+                base = d.get('idea_score', 0) + d.get('view_count', 0) * 0.25 + 1
+                pub = by_id[d['id']].published_at or now
+                age_h = max((now - pub).total_seconds() / 3600.0, 0)
+                return base / ((age_h + 2) ** 1.5)
+
+            serialized.sort(key=trend_score, reverse=True)
+            total = len(serialized)
+            pages = max(1, (total + per_page - 1) // per_page)
+            start = (page - 1) * per_page
+            result = serialized[start:start + per_page]
+            feed_cache[cache_key] = {"entries": result, "total": total, "pages": pages, "page": page, "per_page": per_page}
+            return jsonify({"entries": result, "total": total, "page": page, "per_page": per_page, "pages": pages}), 200
 
         if ranked:
             # Relevance ordering already applied by apply_search; recency as tiebreak.
@@ -1561,20 +1593,10 @@ def community_feed():
         elif sort == 'popular':
             query = query.order_by(CatalogEntry.view_count.desc(), CatalogEntry.published_at.desc())
         else:
-            # 'trending' is re-sorted post-query via idea_score; default is recency.
             query = query.order_by(CatalogEntry.published_at.desc())
-            
-        t1 = time.time()
 
         pagination = query.paginate(page=page, per_page=per_page, error_out=False)
-        t2 = time.time()
-        t3 = time.time()
-
         result = serialize_entries_batch(list(pagination.items), user_id)
-        
-        # Sort by idea_score for trending
-        if sort == 'trending':
-            result.sort(key=lambda x: x.get('idea_score', 0), reverse=True)
 
         feed_cache[cache_key] = {
             "entries": result,
@@ -1593,6 +1615,35 @@ def community_feed():
         }), 200
     except Exception as e:
         print(f"Error in community feed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+_tags_cache = TTLCache(maxsize=1, ttl=120.0)
+
+
+@app.route('/api/community/tags', methods=['GET'])
+def popular_tags():
+    """Most-used tags across published ideas, with counts (2-min cached)."""
+    try:
+        if 'top' in _tags_cache:
+            return jsonify(_tags_cache['top']), 200
+        rows = db.session.query(CatalogEntry.tags).filter(
+            CatalogEntry.visibility == 'public',
+            CatalogEntry.status == 'completed',
+            CatalogEntry.tags.isnot(None),
+        ).all()
+        counts = {}
+        for (tags,) in rows:
+            if isinstance(tags, list):
+                for t in tags:
+                    if t and isinstance(t, str):
+                        key = t.strip()
+                        if key:
+                            counts[key] = counts.get(key, 0) + 1
+        top = [{"tag": k, "count": v} for k, v in sorted(counts.items(), key=lambda x: x[1], reverse=True)[:20]]
+        _tags_cache['top'] = top
+        return jsonify(top), 200
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
