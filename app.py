@@ -4,7 +4,7 @@ import base64
 from functools import wraps
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
-from models import db, User, CatalogEntry, ChatMessage, CatalogEmbedding, Comment, Like, Bookmark, Reaction, ConnectRequest, Notification, IdeaUpdate, Collaborator, Follow, REACTION_TYPES, CONNECT_ROLES
+from models import db, User, CatalogEntry, ChatMessage, CatalogEmbedding, Comment, Like, Bookmark, Reaction, ConnectRequest, Notification, IdeaUpdate, Collaborator, Follow, WorkspaceTask, WorkspaceNote, TASK_STATUSES, REACTION_TYPES, CONNECT_ROLES
 from datetime import datetime
 import uuid
 import requests as http_requests
@@ -171,6 +171,7 @@ _INDEX_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS ix_collab_user ON collaborators (user_id)",
     "CREATE INDEX IF NOT EXISTS ix_follow_follower ON follows (follower_id)",
     "CREATE INDEX IF NOT EXISTS ix_follow_following ON follows (following_id)",
+    "CREATE INDEX IF NOT EXISTS ix_wstasks_entry ON workspace_tasks (catalog_entry_id)",
 ]
 
 
@@ -179,6 +180,12 @@ _INDEX_STATEMENTS = [
 # dev DBs already include the column via create_all().
 _MIGRATION_STATEMENTS = [
     "ALTER TABLE catalog_entries ADD COLUMN IF NOT EXISTS remixed_from VARCHAR(36)",
+    # Enable Supabase Realtime broadcasts for the collab workspace tables.
+    # Not idempotent (errors if already a member) — the per-stmt try/except below
+    # swallows that. If it lacks permission, enable in Supabase > Database >
+    # Replication instead.
+    "ALTER PUBLICATION supabase_realtime ADD TABLE workspace_tasks",
+    "ALTER PUBLICATION supabase_realtime ADD TABLE workspace_notes",
 ]
 
 
@@ -2892,6 +2899,130 @@ def get_workspace(request_id):
             'tags': entry.tags,
         },
     })
+
+
+# ============================================================
+# Collab Workspace: shared task board + notes (Supabase Realtime broadcasts
+# row changes; the frontend refetches from here on any change).
+# ============================================================
+
+def _workspace_entry(entry_id):
+    """Return the entry if the current user is its owner or a collaborator, else None."""
+    entry = CatalogEntry.query.get(entry_id)
+    if not entry:
+        return None, ("Entry not found", 404)
+    if entry.user_id != g.user_id and not Collaborator.query.filter_by(user_id=g.user_id, catalog_entry_id=entry_id).first():
+        return None, ("Unauthorized", 403)
+    return entry, None
+
+
+def _task_json(t):
+    return {
+        "id": t.id, "catalog_entry_id": t.catalog_entry_id, "title": t.title,
+        "status": t.status, "position": t.position, "created_by": t.created_by,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+        "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+    }
+
+
+@app.route('/api/catalogs/<entry_id>/workspace', methods=['GET'])
+@auth_required
+def get_workspace_board(entry_id):
+    entry, err = _workspace_entry(entry_id)
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    tasks = WorkspaceTask.query.filter_by(catalog_entry_id=entry_id) \
+        .order_by(WorkspaceTask.position.asc(), WorkspaceTask.created_at.asc()).all()
+    note = WorkspaceNote.query.get(entry_id)
+    return jsonify({
+        "tasks": [_task_json(t) for t in tasks],
+        "notes": {
+            "content": note.content if note else "",
+            "updated_at": note.updated_at.isoformat() if note and note.updated_at else None,
+            "updated_by": note.updated_by if note else None,
+        },
+    }), 200
+
+
+@app.route('/api/catalogs/<entry_id>/tasks', methods=['POST'])
+@auth_required
+@limiter.limit("120 per minute")
+def create_task(entry_id):
+    entry, err = _workspace_entry(entry_id)
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    data = request.json or {}
+    title = (data.get('title') or '').strip()
+    if not title:
+        return jsonify({"error": "title is required"}), 400
+    status = data.get('status', 'todo')
+    if status not in TASK_STATUSES:
+        status = 'todo'
+    maxpos = db.session.query(db.func.coalesce(db.func.max(WorkspaceTask.position), 0)).filter_by(catalog_entry_id=entry_id).scalar()
+    task = WorkspaceTask(id=str(uuid.uuid4()), catalog_entry_id=entry_id, title=title[:500],
+                         status=status, position=(maxpos or 0) + 1, created_by=g.user_id)
+    db.session.add(task)
+    db.session.commit()
+    return jsonify(_task_json(task)), 201
+
+
+@app.route('/api/catalogs/<entry_id>/tasks/<task_id>', methods=['PUT'])
+@auth_required
+def update_task(entry_id, task_id):
+    entry, err = _workspace_entry(entry_id)
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    task = WorkspaceTask.query.filter_by(id=task_id, catalog_entry_id=entry_id).first()
+    if not task:
+        return jsonify({"error": "Task not found"}), 404
+    data = request.json or {}
+    if 'title' in data:
+        title = (data.get('title') or '').strip()
+        if not title:
+            return jsonify({"error": "title cannot be empty"}), 400
+        task.title = title[:500]
+    if 'status' in data and data['status'] in TASK_STATUSES:
+        task.status = data['status']
+    if 'position' in data and isinstance(data['position'], int):
+        task.position = data['position']
+    task.updated_at = datetime.utcnow()
+    db.session.commit()
+    return jsonify(_task_json(task)), 200
+
+
+@app.route('/api/catalogs/<entry_id>/tasks/<task_id>', methods=['DELETE'])
+@auth_required
+def delete_task(entry_id, task_id):
+    entry, err = _workspace_entry(entry_id)
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    task = WorkspaceTask.query.filter_by(id=task_id, catalog_entry_id=entry_id).first()
+    if not task:
+        return jsonify({"error": "Task not found"}), 404
+    db.session.delete(task)
+    db.session.commit()
+    return jsonify({"status": "deleted"}), 200
+
+
+@app.route('/api/catalogs/<entry_id>/notes', methods=['PUT'])
+@auth_required
+@limiter.limit("120 per minute")
+def save_notes(entry_id):
+    entry, err = _workspace_entry(entry_id)
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    content = (request.json or {}).get('content', '')
+    if not isinstance(content, str):
+        return jsonify({"error": "content must be a string"}), 400
+    note = WorkspaceNote.query.get(entry_id)
+    if not note:
+        note = WorkspaceNote(catalog_entry_id=entry_id)
+        db.session.add(note)
+    note.content = content[:20000]
+    note.updated_by = g.user_id
+    note.updated_at = datetime.utcnow()
+    db.session.commit()
+    return jsonify({"status": "saved", "updated_at": note.updated_at.isoformat()}), 200
 
 
 @app.route('/api/catalogs/<entry_id>/collaborators/<user_id>', methods=['DELETE'])

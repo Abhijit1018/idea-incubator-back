@@ -195,6 +195,29 @@ class IdeaUpdate(db.Model):
     user = db.relationship('User', backref=db.backref('idea_updates', lazy=True))
 
 
+class WorkspaceTask(db.Model):
+    __tablename__ = 'workspace_tasks'
+    id = db.Column(db.String(36), primary_key=True, default=generate_uuid)
+    catalog_entry_id = db.Column(db.String(36), db.ForeignKey('catalog_entries.id'), nullable=False)
+    title = db.Column(db.String(500), nullable=False)
+    status = db.Column(db.String(20), default='todo')  # todo, doing, done
+    position = db.Column(db.Integer, default=0)
+    created_by = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class WorkspaceNote(db.Model):
+    __tablename__ = 'workspace_notes'
+    catalog_entry_id = db.Column(db.String(36), db.ForeignKey('catalog_entries.id'), primary_key=True)
+    content = db.Column(db.Text, default='')
+    updated_by = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+TASK_STATUSES = ['todo', 'doing', 'done']
+
+
 class Follow(db.Model):
     __tablename__ = 'follows'
     id = db.Column(db.String(36), primary_key=True, default=generate_uuid)
