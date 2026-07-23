@@ -4,7 +4,7 @@ import base64
 from functools import wraps
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
-from models import db, User, CatalogEntry, ChatMessage, CatalogEmbedding, Comment, Like, Bookmark, Reaction, ConnectRequest, Notification, IdeaUpdate, Collaborator, REACTION_TYPES, CONNECT_ROLES
+from models import db, User, CatalogEntry, ChatMessage, CatalogEmbedding, Comment, Like, Bookmark, Reaction, ConnectRequest, Notification, IdeaUpdate, Collaborator, Follow, REACTION_TYPES, CONNECT_ROLES
 from datetime import datetime
 import uuid
 import requests as http_requests
@@ -169,6 +169,8 @@ _INDEX_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS ix_chat_entry ON chat_messages (catalog_entry_id)",
     "CREATE INDEX IF NOT EXISTS ix_notifications_user ON notifications (user_id, is_read)",
     "CREATE INDEX IF NOT EXISTS ix_collab_user ON collaborators (user_id)",
+    "CREATE INDEX IF NOT EXISTS ix_follow_follower ON follows (follower_id)",
+    "CREATE INDEX IF NOT EXISTS ix_follow_following ON follows (following_id)",
 ]
 
 
@@ -2229,6 +2231,18 @@ def get_public_profile(user_id):
             for rtype, cnt in rmap.items():
                 total_reactions[rtype] = total_reactions.get(rtype, 0) + cnt
 
+        # Follow graph + whether the current viewer follows this user.
+        follower_count = Follow.query.filter_by(following_id=user_id).count()
+        following_count = Follow.query.filter_by(follower_id=user_id).count()
+        is_following = False
+        viewer_id = None
+        auth_header = request.headers.get('Authorization', '')
+        if auth_header.startswith('Bearer '):
+            su = verify_supabase_token(auth_header[7:])
+            if su:
+                viewer_id = su.get('id')
+                is_following = Follow.query.filter_by(follower_id=viewer_id, following_id=user_id).first() is not None
+
         return jsonify({
             "id": user.id,
             "name": user.name or user.email.split('@')[0],
@@ -2240,9 +2254,85 @@ def get_public_profile(user_id):
             "created_at": user.created_at.isoformat(),
             "ideas": ideas_data,
             "published_count": len(ideas_data),
-            "total_reactions": total_reactions
+            "total_reactions": total_reactions,
+            "follower_count": follower_count,
+            "following_count": following_count,
+            "is_following": is_following,
+            "is_self": viewer_id == user_id,
         }), 200
     except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/users/<user_id>/follow', methods=['POST'])
+@auth_required
+def toggle_follow(user_id):
+    """Follow / unfollow a builder."""
+    try:
+        if user_id == g.user_id:
+            return jsonify({"error": "You can't follow yourself"}), 400
+        target = User.query.get(user_id)
+        if not target:
+            return jsonify({"error": "User not found"}), 404
+
+        existing = Follow.query.filter_by(follower_id=g.user_id, following_id=user_id).first()
+        if existing:
+            db.session.delete(existing)
+            db.session.commit()
+            following = False
+        else:
+            db.session.add(Follow(id=str(uuid.uuid4()), follower_id=g.user_id, following_id=user_id))
+            db.session.commit()
+            following = True
+            notif = Notification(
+                id=str(uuid.uuid4()),
+                user_id=user_id,
+                type='follow',
+                title=f"{g.user_name or g.user_email.split('@')[0]} started following you",
+                message=None,
+                link=f'/profile/{g.user_id}',
+            )
+            db.session.add(notif)
+            db.session.commit()
+
+        return jsonify({
+            "following": following,
+            "follower_count": Follow.query.filter_by(following_id=user_id).count(),
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/feed/following', methods=['GET'])
+@auth_required
+def following_feed():
+    """Personalized feed: published ideas from builders the user follows."""
+    try:
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 20, type=int)
+
+        followed_ids = [f.following_id for f in Follow.query.filter_by(follower_id=g.user_id).all()]
+        if not followed_ids:
+            return jsonify({"entries": [], "total": 0, "page": page, "per_page": per_page, "pages": 0, "empty_reason": "not_following"}), 200
+
+        query = CatalogEntry.query.filter(
+            CatalogEntry.user_id.in_(followed_ids),
+            CatalogEntry.visibility == 'public',
+            CatalogEntry.status == 'completed',
+        ).order_by(CatalogEntry.published_at.desc())
+
+        pagination = query.paginate(page=page, per_page=per_page, error_out=False)
+        result = serialize_entries_batch(list(pagination.items), g.user_id)
+        return jsonify({
+            "entries": result,
+            "total": pagination.total,
+            "page": page,
+            "per_page": per_page,
+            "pages": pagination.pages,
+        }), 200
+    except Exception as e:
+        db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
 

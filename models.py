@@ -195,6 +195,16 @@ class IdeaUpdate(db.Model):
     user = db.relationship('User', backref=db.backref('idea_updates', lazy=True))
 
 
+class Follow(db.Model):
+    __tablename__ = 'follows'
+    id = db.Column(db.String(36), primary_key=True, default=generate_uuid)
+    follower_id = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=False)   # who follows
+    following_id = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=False)  # who is followed
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    __table_args__ = (db.UniqueConstraint('follower_id', 'following_id', name='uq_follow_pair'),)
+
+
 class Collaborator(db.Model):
     __tablename__ = 'collaborators'
     user_id = db.Column(db.String(36), db.ForeignKey('users.id'), primary_key=True)
