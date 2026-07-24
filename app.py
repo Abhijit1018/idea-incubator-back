@@ -1277,6 +1277,12 @@ def regenerate_entry(entry_id):
 
         entry.status = 'pending'
         entry.retry_count = 0
+        # Drop stale images that were saved to the ephemeral local disk — those
+        # 404 after a redeploy, so a re-run should show a clean empty state
+        # rather than a broken link. Persistent hosted URLs (e.g. ImgBB) are
+        # kept until the new pipeline run replaces them.
+        if entry.image_url and '/static/uploads/' in entry.image_url:
+            entry.image_url = None
         entry.updated_at = datetime.utcnow()
         db.session.commit()
 
