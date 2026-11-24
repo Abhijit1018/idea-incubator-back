@@ -4,7 +4,7 @@ import base64
 from functools import wraps
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
-from models import db, User, CatalogEntry, ChatMessage, CatalogEmbedding, Comment, Like, Bookmark, Reaction, ConnectRequest, Notification, IdeaUpdate, Collaborator, Follow, WorkspaceTask, WorkspaceNote, TASK_STATUSES, REACTION_TYPES, CONNECT_ROLES
+from models import db, User, CatalogEntry, ChatMessage, CatalogEmbedding, Comment, Like, Bookmark, Reaction, ConnectRequest, Notification, IdeaUpdate, Collaborator, Follow, WorkspaceTask, WorkspaceNote, IdeaValidation, TASK_STATUSES, REACTION_TYPES, CONNECT_ROLES, BUILD_STATUSES, VALIDATION_USE, VALIDATION_PAY_TIERS
 from datetime import datetime
 import uuid
 import requests as http_requests
@@ -189,6 +189,13 @@ _INDEX_STATEMENTS = [
 # dev DBs already include the column via create_all().
 _MIGRATION_STATEMENTS = [
     "ALTER TABLE catalog_entries ADD COLUMN IF NOT EXISTS remixed_from VARCHAR(36)",
+    "ALTER TABLE catalog_entries ADD COLUMN IF NOT EXISTS title VARCHAR(120)",
+    "ALTER TABLE catalog_entries ADD COLUMN IF NOT EXISTS tagline VARCHAR(200)",
+    "ALTER TABLE catalog_entries ADD COLUMN IF NOT EXISTS build_status VARCHAR(20)",
+    "ALTER TABLE catalog_entries ADD COLUMN IF NOT EXISTS looking_for JSON",
+    "ALTER TABLE comments ADD COLUMN IF NOT EXISTS edited BOOLEAN DEFAULT FALSE",
+    "CREATE INDEX IF NOT EXISTS ix_validations_entry ON idea_validations (catalog_entry_id)",
+    "CREATE INDEX IF NOT EXISTS ix_comments_parent ON comments (parent_id)",
     # Enable Supabase Realtime broadcasts for the collab workspace tables.
     # Not idempotent (errors if already a member) — the per-stmt try/except below
     # swallows that. If it lacks permission, enable in Supabase > Database >
@@ -198,13 +205,21 @@ _MIGRATION_STATEMENTS = [
 ]
 
 
+def _ddl_with_lock_timeout(stmt):
+    """Run one DDL statement with a short lock_timeout. If another session holds
+    a conflicting lock, fail fast and retry next boot instead of queueing every
+    normal query behind a waiting ACCESS EXCLUSIVE lock (a full API stall)."""
+    db.session.execute(db.text("SET LOCAL lock_timeout = '5s'"))
+    db.session.execute(db.text(stmt))
+    db.session.commit()
+
+
 def run_migrations():
     if db.engine.name != 'postgresql':
         return
     for stmt in _MIGRATION_STATEMENTS:
         try:
-            db.session.execute(db.text(stmt))
-            db.session.commit()
+            _ddl_with_lock_timeout(stmt)
         except Exception as e:
             db.session.rollback()
             print(f"Migration skipped ({stmt}): {e}", file=sys.stderr)
@@ -218,6 +233,7 @@ _APP_TABLES = [
     'users', 'catalog_entries', 'chat_messages', 'catalog_embeddings', 'comments',
     'likes', 'bookmarks', 'reactions', 'connect_requests', 'notifications',
     'idea_updates', 'collaborators', 'follows', 'workspace_tasks', 'workspace_notes',
+    'idea_validations',
 ]
 
 
@@ -235,10 +251,18 @@ def harden_rls():
     if os.getenv('HARDEN_RLS', 'true').lower() != 'true':
         print("RLS hardening disabled via HARDEN_RLS=false", file=sys.stderr)
         return
+    already = set()
+    try:
+        already = {r[0] for r in db.session.execute(db.text(
+            "SELECT relname FROM pg_class WHERE relrowsecurity AND relnamespace = 'public'::regnamespace")).all()}
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
     for t in _APP_TABLES:
+        if t in already:
+            continue  # no ALTER (and no ACCESS EXCLUSIVE lock) on every boot
         try:
-            db.session.execute(db.text(f'ALTER TABLE {t} ENABLE ROW LEVEL SECURITY'))
-            db.session.commit()
+            _ddl_with_lock_timeout(f'ALTER TABLE {t} ENABLE ROW LEVEL SECURITY')
             # Owner bypasses RLS, so this must still succeed. If it doesn't, the
             # backend isn't the owner and RLS would lock it out — roll back.
             db.session.execute(db.text(f'SELECT 1 FROM {t} LIMIT 1'))
@@ -306,8 +330,7 @@ def create_indexes():
         return
     for stmt in _INDEX_STATEMENTS:
         try:
-            db.session.execute(db.text(stmt))
-            db.session.commit()
+            _ddl_with_lock_timeout(stmt)
         except Exception as e:
             db.session.rollback()
             print(f"Index create skipped ({stmt}): {e}", file=sys.stderr)
@@ -621,14 +644,16 @@ def public_stats():
         public_ideas = CatalogEntry.query.filter_by(visibility='public', status='completed').count()
         recent_public = CatalogEntry.query.filter_by(
             visibility='public', status='completed'
-        ).order_by(CatalogEntry.published_at.desc()).limit(3).all()
+        ).order_by(CatalogEntry.published_at.desc()).limit(4).all()
 
         def mini_serialize(e):
             tags = e.tags or []
             return {
                 'id': e.id,
                 'raw_input': e.raw_input,
-                'summary': (e.summary or '')[:120],
+                'title': e.title,
+                'tagline': e.tagline,
+                'summary': (e.summary or '')[:160],
                 'tags': tags[:3],
                 'image_url': e.image_url,
             }
@@ -676,7 +701,7 @@ def delete_account():
             Comment.query.filter(Comment.id.in_(doomed_comment_ids)).delete(**sync)
 
         # Rows authored by the user anywhere, or attached to the user's ideas.
-        for model in (Like, Bookmark, Reaction, ChatMessage, IdeaUpdate):
+        for model in (Like, Bookmark, Reaction, ChatMessage, IdeaUpdate, IdeaValidation):
             model.query.filter((model.user_id == user_id) | on_owned(model.catalog_entry_id)).delete(**sync)
         Collaborator.query.filter((Collaborator.user_id == user_id) | on_owned(Collaborator.catalog_entry_id)).delete(**sync)
         ConnectRequest.query.filter(
@@ -775,7 +800,17 @@ def background_retry_job(app):
                     
             except Exception as e:
                 print(f"Error in background retry task: {e}")
-                
+            finally:
+                # End the transaction every loop. Without this, the SELECT above
+                # left the connection "idle in transaction" forever: it held
+                # locks that block any ALTER TABLE (startup migrations then queue
+                # every other query behind them) and pinned an old snapshot so
+                # autovacuum could never clean up.
+                try:
+                    db.session.rollback()
+                finally:
+                    db.session.remove()
+
             time.sleep(60) # Run check every 60 seconds
 
 @app.route('/api/ideas/submit', methods=['POST'])
@@ -926,6 +961,13 @@ def n8n_callback():
         entry.tech_stack = tech_stack
         entry.pros_cons = pros_cons
         entry.similar_tools = similar_tools
+
+        ai_title = (request.form.get('title') or '').strip().strip('"')
+        ai_tagline = (request.form.get('tagline') or '').strip().strip('"')
+        if ai_title:
+            entry.title = ai_title[:120]
+        if ai_tagline:
+            entry.tagline = ai_tagline[:200]
 
         # Tags were parsed but never saved before, so tag explore was always empty.
         if isinstance(tags, list):
@@ -1511,9 +1553,23 @@ def update_catalog_entry(entry_id):
             'market_trend': str,
             'mermaid_syntax': str,
             'tags': (list, str),
+            'title': str,
+            'tagline': str,
         }
 
         updated_fields = []
+        if 'build_status' in payload:
+            bs = payload['build_status']
+            if bs is not None and bs not in BUILD_STATUSES:
+                return jsonify({"error": "build_status must be exploring, building or launched"}), 400
+            entry.build_status = bs
+            updated_fields.append('build_status')
+        if 'looking_for' in payload:
+            lf = payload['looking_for'] or []
+            if not isinstance(lf, list) or any(r not in CONNECT_ROLES for r in lf):
+                return jsonify({"error": f"looking_for must be a list of: {CONNECT_ROLES}"}), 400
+            entry.looking_for = list(dict.fromkeys(lf))
+            updated_fields.append('looking_for')
         for field, expected_types in editable_fields.items():
             if field in payload:
                 value = payload[field]
@@ -1527,6 +1583,7 @@ def update_catalog_entry(entry_id):
 
         entry.updated_at = datetime.utcnow()
         db.session.commit()
+        feed_cache.clear()
 
         return jsonify({
             "status": "updated",
@@ -1619,6 +1676,26 @@ def compute_idea_score(entry_id):
     return round(score, 1)
 
 
+# One bounded pool shared by every request. Each feed serialization fans out
+# ~15 small queries; with a per-request pool and threaded Gunicorn workers that
+# could demand 100+ DB connections at once (pool is 30, Supabase caps lower).
+from concurrent.futures import ThreadPoolExecutor as _TPE
+import contextlib as _contextlib
+_SERIALIZE_POOL = _TPE(max_workers=8, thread_name_prefix='serialize')
+
+
+def _validation_summary(rows_use, rows_pay):
+    use = {k: 0 for k in VALIDATION_USE}
+    for k, c in rows_use:
+        if k in use:
+            use[k] = c
+    pay = {str(t): 0 for t in VALIDATION_PAY_TIERS}
+    for t, c in rows_pay:
+        if t is not None and str(t) in pay:
+            pay[str(t)] = c
+    return {"use": use, "pay": pay, "total": sum(use.values())}
+
+
 def serialize_entries_batch(entries, user_id=None):
     """Batch serialize multiple entries with minimal DB queries (N+1 fix)."""
     if not entries:
@@ -1626,7 +1703,6 @@ def serialize_entries_batch(entries, user_id=None):
     entry_ids = [e.id for e in entries]
     owner_ids = list(set(e.user_id for e in entries))
 
-    from concurrent.futures import ThreadPoolExecutor
     from flask import current_app
     app_obj = current_app._get_current_object()
 
@@ -1637,7 +1713,7 @@ def serialize_entries_batch(entries, user_id=None):
             finally:
                 db.session.remove()
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with _contextlib.nullcontext(_SERIALIZE_POOL) as executor:
         f_likes = executor.submit(fetch_in_context, lambda: dict(db.session.query(Like.catalog_entry_id, db.func.count(Like.id)).filter(Like.catalog_entry_id.in_(entry_ids)).group_by(Like.catalog_entry_id).all()))
         f_comments = executor.submit(fetch_in_context, lambda: dict(db.session.query(Comment.catalog_entry_id, db.func.count(Comment.id)).filter(Comment.catalog_entry_id.in_(entry_ids)).group_by(Comment.catalog_entry_id).all()))
         f_bookmarks = executor.submit(fetch_in_context, lambda: dict(db.session.query(Bookmark.catalog_entry_id, db.func.count(Bookmark.id)).filter(Bookmark.catalog_entry_id.in_(entry_ids)).group_by(Bookmark.catalog_entry_id).all()))
@@ -1646,12 +1722,16 @@ def serialize_entries_batch(entries, user_id=None):
         f_reactions = executor.submit(fetch_in_context, lambda: db.session.query(Reaction.catalog_entry_id, Reaction.reaction_type, db.func.count(Reaction.id)).filter(Reaction.catalog_entry_id.in_(entry_ids)).group_by(Reaction.catalog_entry_id, Reaction.reaction_type).all())
         f_authors = executor.submit(fetch_in_context, lambda: {u.id: u for u in User.query.filter(User.id.in_(owner_ids)).all()})
         f_collabs = executor.submit(fetch_in_context, lambda: db.session.query(Collaborator.catalog_entry_id, User, Collaborator.role).join(User, Collaborator.user_id == User.id).filter(Collaborator.catalog_entry_id.in_(entry_ids)).all())
+        f_val_use = executor.submit(fetch_in_context, lambda: db.session.query(IdeaValidation.catalog_entry_id, IdeaValidation.would_use, db.func.count(IdeaValidation.id)).filter(IdeaValidation.catalog_entry_id.in_(entry_ids)).group_by(IdeaValidation.catalog_entry_id, IdeaValidation.would_use).all())
+        f_val_pay = executor.submit(fetch_in_context, lambda: db.session.query(IdeaValidation.catalog_entry_id, IdeaValidation.pay_tier, db.func.count(IdeaValidation.id)).filter(IdeaValidation.catalog_entry_id.in_(entry_ids)).group_by(IdeaValidation.catalog_entry_id, IdeaValidation.pay_tier).all())
+        f_remixes = executor.submit(fetch_in_context, lambda: dict(db.session.query(CatalogEntry.remixed_from, db.func.count(CatalogEntry.id)).filter(CatalogEntry.remixed_from.in_(entry_ids)).group_by(CatalogEntry.remixed_from).all()))
 
         if user_id:
             f_user_likes = executor.submit(fetch_in_context, lambda: set(r[0] for r in db.session.query(Like.catalog_entry_id).filter(Like.catalog_entry_id.in_(entry_ids), Like.user_id == user_id).all()))
             f_user_bookmarks = executor.submit(fetch_in_context, lambda: set(r[0] for r in db.session.query(Bookmark.catalog_entry_id).filter(Bookmark.catalog_entry_id.in_(entry_ids), Bookmark.user_id == user_id).all()))
             f_user_reacts = executor.submit(fetch_in_context, lambda: db.session.query(Reaction.catalog_entry_id, Reaction.reaction_type).filter(Reaction.catalog_entry_id.in_(entry_ids), Reaction.user_id == user_id).all())
             f_user_connects = executor.submit(fetch_in_context, lambda: set(r[0] for r in db.session.query(ConnectRequest.catalog_entry_id).filter(ConnectRequest.catalog_entry_id.in_(entry_ids), ConnectRequest.requester_id == user_id).all()))
+            f_user_vals = executor.submit(fetch_in_context, lambda: {r[0]: {"would_use": r[1], "pay_tier": r[2]} for r in db.session.query(IdeaValidation.catalog_entry_id, IdeaValidation.would_use, IdeaValidation.pay_tier).filter(IdeaValidation.catalog_entry_id.in_(entry_ids), IdeaValidation.user_id == user_id).all()})
 
         # Await all futures
         like_counts = f_likes.result()
@@ -1662,11 +1742,15 @@ def serialize_entries_batch(entries, user_id=None):
         reaction_rows = f_reactions.result()
         authors = f_authors.result()
         collab_rows = f_collabs.result()
+        val_use_rows = f_val_use.result()
+        val_pay_rows = f_val_pay.result()
+        remix_counts = f_remixes.result()
 
         user_likes = set()
         user_bookmarks = set()
         user_reactions_map = {}
         user_connects = set()
+        user_vals = {}
         
         if user_id:
             user_likes = f_user_likes.result()
@@ -1674,16 +1758,23 @@ def serialize_entries_batch(entries, user_id=None):
             for eid, rtype in f_user_reacts.result():
                 user_reactions_map.setdefault(eid, []).append(rtype)
             user_connects = f_user_connects.result()
+            user_vals = f_user_vals.result()
 
     reaction_map = {}
     for eid, rtype, cnt in reaction_rows:
         reaction_map.setdefault(eid, {})[rtype] = cnt
 
+    val_use_map, val_pay_map = {}, {}
+    for eid, k, c in val_use_rows:
+        val_use_map.setdefault(eid, []).append((k, c))
+    for eid, t, c in val_pay_rows:
+        val_pay_map.setdefault(eid, []).append((t, c))
+
     collab_map = {}
     for eid, user_obj, role in collab_rows:
         collab_map.setdefault(eid, []).append({
             "id": user_obj.id,
-            "name": user_obj.name or user_obj.email.split('@')[0],
+            "name": user_obj.name or "Builder",
             "avatar_url": user_obj.avatar_url,
             "role": role
         })
@@ -1710,6 +1801,12 @@ def serialize_entries_batch(entries, user_id=None):
             "tags": getattr(e, 'tags', None),
             "visible_fields": getattr(e, 'visible_fields', None),
             "remixed_from": getattr(e, 'remixed_from', None),
+            "title": getattr(e, 'title', None),
+            "tagline": getattr(e, 'tagline', None),
+            "build_status": getattr(e, 'build_status', None),
+            "looking_for": getattr(e, 'looking_for', None) or [],
+            "remix_count": remix_counts.get(e.id, 0),
+            "validation": _validation_summary(val_use_map.get(e.id, []), val_pay_map.get(e.id, [])),
             "created_at": e.created_at.isoformat(),
             "updated_at": e.updated_at.isoformat() if getattr(e, 'updated_at', None) else None,
             "like_count": like_counts.get(e.id, 0),
@@ -1725,7 +1822,7 @@ def serialize_entries_batch(entries, user_id=None):
         if author:
             data["author"] = {
                 "id": author.id,
-                "name": author.name or author.email.split('@')[0],
+                "name": author.name or "Builder",
                 "avatar_url": author.avatar_url,
             }
         if user_id:
@@ -1733,6 +1830,7 @@ def serialize_entries_batch(entries, user_id=None):
             data["bookmarked_by_user"] = e.id in user_bookmarks
             data["user_reactions"] = user_reactions_map.get(e.id, [])
             data["connect_sent"] = e.id in user_connects
+            data["user_validation"] = user_vals.get(e.id)
 
         # Apply visible_fields filter — owner sees same as everyone else in community feed
         vis = getattr(e, 'visible_fields', None)
@@ -1771,6 +1869,10 @@ def serialize_entry(e, user_id=None):
         "tags": getattr(e, 'tags', None),
         "visible_fields": getattr(e, 'visible_fields', None),
         "remixed_from": getattr(e, 'remixed_from', None),
+        "title": getattr(e, 'title', None),
+        "tagline": getattr(e, 'tagline', None),
+        "build_status": getattr(e, 'build_status', None),
+        "looking_for": getattr(e, 'looking_for', None) or [],
         "created_at": e.created_at.isoformat(),
         "updated_at": e.updated_at.isoformat() if getattr(e, 'updated_at', None) else None,
     }
@@ -1795,7 +1897,7 @@ def serialize_entry(e, user_id=None):
     if author:
         data["author"] = {
             "id": author.id,
-            "name": author.name or author.email.split('@')[0],
+            "name": author.name or "Builder",
             "avatar_url": author.avatar_url,
         }
     # Current user interactions
@@ -1990,7 +2092,7 @@ def get_public_entry(entry_id):
             except Exception:
                 db.session.rollback()
 
-        return jsonify(serialize_entry(entry, viewer_id)), 200
+        return jsonify(serialize_entries_batch([entry], viewer_id)[0]), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -2038,9 +2140,9 @@ def remix_entry(entry_id):
                 id=str(uuid.uuid4()),
                 user_id=source.user_id,
                 type='remix',
-                title=f"{g.user_name or g.user_email.split('@')[0]} remixed your idea",
+                title=f"{g.user_name or 'Someone'} remixed your idea",
                 message=source.raw_input[:100],
-                link=f'/community?post={source.id}',
+                link=f'/idea/{source.id}',
             )
             db.session.add(notif)
             db.session.commit()
@@ -2294,34 +2396,48 @@ def unpublish_entry(entry_id):
 
 @app.route('/api/community/<entry_id>/comments', methods=['GET'])
 def get_comments(entry_id):
-    """Get comments for a public entry."""
+    """Threaded comments for an entry: 3 queries total (was 2 per comment,
+    recursively). Private entries' comments are only visible to the owner."""
     try:
         entry = CatalogEntry.query.get(entry_id)
-        if not entry:
+        if not entry or not public_or_owner(entry, _optional_viewer_id()):
             return jsonify({"error": "Entry not found"}), 404
 
-        comments = Comment.query.filter_by(
-            catalog_entry_id=entry_id, parent_id=None
-        ).order_by(Comment.created_at.asc()).all()
+        rows = (Comment.query.filter_by(catalog_entry_id=entry_id)
+                .order_by(Comment.created_at.asc()).all())
+        author_ids = list({c.user_id for c in rows})
+        authors = {u.id: u for u in User.query.filter(User.id.in_(author_ids)).all()} if author_ids else {}
 
-        def serialize_comment(c):
-            author = User.query.get(c.user_id)
-            replies = Comment.query.filter_by(parent_id=c.id).order_by(Comment.created_at.asc()).all()
+        def ser(c):
+            a = authors.get(c.user_id)
             return {
                 "id": c.id,
                 "content": c.content,
+                "parent_id": c.parent_id,
                 "created_at": c.created_at.isoformat(),
-                "author": {
-                    "id": author.id,
-                    "name": author.name or author.email.split('@')[0],
-                    "avatar_url": author.avatar_url,
-                } if author else None,
-                "replies": [serialize_comment(r) for r in replies],
+                "edited": bool(getattr(c, 'edited', False)),
+                "author": {"id": a.id, "name": a.name or "Builder", "avatar_url": a.avatar_url} if a else None,
+                "replies": [],
             }
 
-        return jsonify([serialize_comment(c) for c in comments]), 200
+        by_id = {c.id: ser(c) for c in rows}
+        top = []
+        for c in rows:
+            node = by_id[c.id]
+            parent = by_id.get(c.parent_id) if c.parent_id else None
+            if parent is None:
+                top.append(node)
+            else:
+                # One level of nesting in the UI: replies-to-replies attach to the
+                # top-level ancestor so threads never indent off-screen on mobile.
+                root = parent
+                while root.get("parent_id") and by_id.get(root["parent_id"]):
+                    root = by_id[root["parent_id"]]
+                root["replies"].append(node)
+        return jsonify(top), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"get_comments error: {e}", file=sys.stderr)
+        return jsonify({"error": "Could not load comments"}), 500
 
 
 def public_or_owner(entry, user_id):
@@ -2330,60 +2446,237 @@ def public_or_owner(entry, user_id):
     return entry.visibility == 'public' or entry.user_id == user_id
 
 
+def _optional_viewer_id():
+    """User id from an Authorization header if present and valid, else None."""
+    auth_header = request.headers.get('Authorization', '')
+    if auth_header.startswith('Bearer '):
+        su = verify_supabase_token(auth_header[7:])
+        if su:
+            return su.get('id')
+    return None
+
+
+def _notify(user_id, ntype, title, message, link):
+    db.session.add(Notification(id=str(uuid.uuid4()), user_id=user_id, type=ntype,
+                                title=title[:200], message=(message or '')[:200], link=link))
+
+
+def _comment_json(comment, author):
+    return {
+        "id": comment.id,
+        "content": comment.content,
+        "parent_id": comment.parent_id,
+        "created_at": comment.created_at.isoformat(),
+        "edited": bool(getattr(comment, 'edited', False)),
+        "author": {"id": author.id, "name": author.name or "Builder", "avatar_url": author.avatar_url} if author else None,
+        "replies": [],
+    }
+
+
 @app.route('/api/community/<entry_id>/comments', methods=['POST'])
 @limiter.limit("20 per minute")
 @auth_required
 def post_comment(entry_id):
-    """Post a comment on a public entry."""
+    """Post a comment or a reply. Optional `mentions`: user ids that were
+    @-mentioned (validated server-side) — each gets a notification."""
     try:
         entry = CatalogEntry.query.get(entry_id)
         if not entry or not public_or_owner(entry, g.user_id):
             return jsonify({"error": "Entry not found"}), 404
 
-        data = request.json
-        content = data.get('content', '').strip()
-        parent_id = data.get('parent_id')  # for replies
-
+        data = request.get_json(silent=True) or {}
+        content = (data.get('content') or '').strip()
+        parent_id = data.get('parent_id') or None
         if not content:
             return jsonify({"error": "Content is required"}), 400
+        if len(content) > 2000:
+            return jsonify({"error": "Comment is too long (max 2000 characters)"}), 400
 
-        comment = Comment(
-            id=str(uuid.uuid4()),
-            catalog_entry_id=entry_id,
-            user_id=g.user_id,
-            content=content,
-            parent_id=parent_id,
-        )
+        parent = None
+        if parent_id:
+            parent = Comment.query.get(parent_id)
+            if not parent or parent.catalog_entry_id != entry_id:
+                return jsonify({"error": "Reply target not found"}), 400
+
+        comment = Comment(id=str(uuid.uuid4()), catalog_entry_id=entry_id, user_id=g.user_id,
+                          content=content, parent_id=parent_id)
         db.session.add(comment)
+
+        actor = g.user_name or 'Someone'
+        link = f'/idea/{entry_id}#comments'
+        notified = {g.user_id}
+        if parent and parent.user_id not in notified:
+            _notify(parent.user_id, 'comment', f"{actor} replied to your comment", content, link)
+            notified.add(parent.user_id)
+        mention_ids = [m for m in (data.get('mentions') or []) if isinstance(m, str)][:5]
+        if mention_ids:
+            for u in User.query.filter(User.id.in_(mention_ids)).all():
+                if u.id not in notified:
+                    _notify(u.id, 'mention', f"{actor} mentioned you", content, link)
+                    notified.add(u.id)
+        if entry.user_id not in notified:
+            _notify(entry.user_id, 'comment', f"{actor} commented on your idea", content, link)
         db.session.commit()
 
-        # Notify the idea owner (not on self-comments).
-        if entry.user_id != g.user_id:
-            notif = Notification(
-                id=str(uuid.uuid4()),
-                user_id=entry.user_id,
-                type='comment',
-                title=f"{g.user_name or g.user_email.split('@')[0]} commented on your idea",
-                message=content[:120],
-                link=f'/community?post={entry_id}',
-            )
-            db.session.add(notif)
-            db.session.commit()
-
-        author = User.query.get(g.user_id)
-        return jsonify({
-            "id": comment.id,
-            "content": comment.content,
-            "created_at": comment.created_at.isoformat(),
-            "author": {
-                "id": author.id,
-                "name": author.name or author.email.split('@')[0],
-                "avatar_url": author.avatar_url,
-            } if author else None,
-            "replies": [],
-        }), 201
+        return jsonify(_comment_json(comment, User.query.get(g.user_id))), 201
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        db.session.rollback()
+        print(f"post_comment error: {e}", file=sys.stderr)
+        return jsonify({"error": "Could not post comment"}), 500
+
+
+@app.route('/api/community/<entry_id>/comments/<comment_id>', methods=['PUT'])
+@limiter.limit("30 per minute")
+@auth_required
+def edit_comment(entry_id, comment_id):
+    """Author-only edit."""
+    c = Comment.query.get(comment_id)
+    if not c or c.catalog_entry_id != entry_id:
+        return jsonify({"error": "Comment not found"}), 404
+    if c.user_id != g.user_id:
+        return jsonify({"error": "You can only edit your own comments"}), 403
+    content = ((request.get_json(silent=True) or {}).get('content') or '').strip()
+    if not content:
+        return jsonify({"error": "Content is required"}), 400
+    if len(content) > 2000:
+        return jsonify({"error": "Comment is too long (max 2000 characters)"}), 400
+    c.content = content
+    c.edited = True
+    db.session.commit()
+    return jsonify(_comment_json(c, User.query.get(c.user_id))), 200
+
+
+@app.route('/api/community/<entry_id>/comments/<comment_id>', methods=['DELETE'])
+@auth_required
+def delete_comment(entry_id, comment_id):
+    """The comment's author, or the idea's owner (moderation), may delete it.
+    Its replies go with it."""
+    c = Comment.query.get(comment_id)
+    if not c or c.catalog_entry_id != entry_id:
+        return jsonify({"error": "Comment not found"}), 404
+    entry = CatalogEntry.query.get(entry_id)
+    if c.user_id != g.user_id and (not entry or entry.user_id != g.user_id):
+        return jsonify({"error": "Not allowed"}), 403
+    try:
+        # Collect the whole subtree, delete leaves-first in one statement.
+        ids, frontier = [c.id], [c.id]
+        while frontier:
+            frontier = [r[0] for r in db.session.query(Comment.id).filter(Comment.parent_id.in_(frontier)).all()]
+            ids.extend(frontier)
+        Comment.query.filter(Comment.parent_id.in_(ids)).update({Comment.parent_id: None}, synchronize_session=False)
+        Comment.query.filter(Comment.id.in_(ids)).delete(synchronize_session=False)
+        db.session.commit()
+        return jsonify({"deleted": len(ids)}), 200
+    except Exception as e:
+        db.session.rollback()
+        print(f"delete_comment error: {e}", file=sys.stderr)
+        return jsonify({"error": "Could not delete comment"}), 500
+
+
+# ---- Validation: "Would you use it?" + "What would you pay?" ----
+
+@app.route('/api/community/<entry_id>/validate', methods=['POST'])
+@limiter.limit("30 per minute")
+@auth_required
+def validate_idea(entry_id):
+    """Cast or update your validation vote. Body: {would_use: yes|maybe|no,
+    pay_tier?: 0|99|499|1999}. Owners can't validate their own idea."""
+    entry = CatalogEntry.query.get(entry_id)
+    if not entry or entry.visibility != 'public':
+        return jsonify({"error": "Entry not found"}), 404
+    if entry.user_id == g.user_id:
+        return jsonify({"error": "You can't validate your own idea"}), 400
+    data = request.get_json(silent=True) or {}
+    would_use = data.get('would_use')
+    pay_tier = data.get('pay_tier')
+    if would_use not in VALIDATION_USE:
+        return jsonify({"error": "would_use must be yes, maybe or no"}), 400
+    if pay_tier is not None:
+        try:
+            pay_tier = int(pay_tier)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid pay_tier"}), 400
+        if pay_tier not in VALIDATION_PAY_TIERS:
+            return jsonify({"error": "Invalid pay_tier"}), 400
+    if would_use == 'no':
+        pay_tier = None
+    try:
+        v = IdeaValidation.query.filter_by(catalog_entry_id=entry_id, user_id=g.user_id).first()
+        first_vote = v is None
+        if first_vote:
+            v = IdeaValidation(id=str(uuid.uuid4()), catalog_entry_id=entry_id, user_id=g.user_id,
+                               would_use=would_use, pay_tier=pay_tier)
+            db.session.add(v)
+        else:
+            v.would_use, v.pay_tier = would_use, pay_tier
+        if first_vote and would_use in ('yes', 'maybe'):
+            label = {'yes': 'would use', 'maybe': 'might use'}[would_use]
+            price = f" and pay ₹{pay_tier:,}{'+' if pay_tier == 1999 else ''}/mo" if pay_tier else ''
+            _notify(entry.user_id, 'validation', f"Someone {label} your idea{price}",
+                    entry.title or entry.raw_input, f'/idea/{entry_id}')
+        db.session.commit()
+        feed_cache.clear()
+        summary = serialize_entries_batch([entry], g.user_id)[0]
+        return jsonify({"validation": summary["validation"], "user_validation": summary.get("user_validation")}), 200
+    except Exception as e:
+        db.session.rollback()
+        print(f"validate_idea error: {e}", file=sys.stderr)
+        return jsonify({"error": "Could not save your vote"}), 500
+
+
+@app.route('/api/community/<entry_id>/validate', methods=['DELETE'])
+@auth_required
+def unvalidate_idea(entry_id):
+    IdeaValidation.query.filter_by(catalog_entry_id=entry_id, user_id=g.user_id).delete()
+    db.session.commit()
+    feed_cache.clear()
+    entry = CatalogEntry.query.get(entry_id)
+    if not entry:
+        return jsonify({"error": "Entry not found"}), 404
+    summary = serialize_entries_batch([entry], g.user_id)[0]
+    return jsonify({"validation": summary["validation"], "user_validation": None}), 200
+
+
+@app.route('/api/community/entry/<entry_id>/related', methods=['GET'])
+def related_entries(entry_id):
+    """'More from this builder' + 'Similar ideas' (shared tags) for the idea page."""
+    try:
+        entry = CatalogEntry.query.get(entry_id)
+        if not entry or entry.visibility != 'public':
+            return jsonify({"error": "Entry not found"}), 404
+        viewer = _optional_viewer_id()
+        base = CatalogEntry.query.filter(CatalogEntry.visibility == 'public',
+                                         CatalogEntry.status == 'completed',
+                                         CatalogEntry.id != entry_id)
+        same_author = (base.filter(CatalogEntry.user_id == entry.user_id)
+                       .order_by(CatalogEntry.published_at.desc()).limit(4).all())
+        similar = []
+        tags = [t for t in (entry.tags or []) if isinstance(t, str)][:5]
+        if tags:
+            seen = {e.id for e in same_author}
+            pool = base.filter(CatalogEntry.user_id != entry.user_id).order_by(CatalogEntry.published_at.desc()).limit(200).all()
+            scored = []
+            for e in pool:
+                overlap = len(set(tags) & set(t for t in (e.tags or []) if isinstance(t, str)))
+                if overlap and e.id not in seen:
+                    scored.append((overlap, e))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            similar = [e for _, e in scored[:4]]
+        if len(similar) < 4:
+            have = {e.id for e in similar} | {e.id for e in same_author}
+            fill = (base.filter(CatalogEntry.input_type == entry.input_type, CatalogEntry.user_id != entry.user_id)
+                    .order_by(CatalogEntry.view_count.desc()).limit(12).all())
+            similar += [e for e in fill if e.id not in have][:4 - len(similar)]
+
+        def mini(e):
+            return {"id": e.id, "title": e.title, "raw_input": e.raw_input, "tagline": e.tagline,
+                    "summary": (e.summary or '')[:160], "image_url": e.image_url,
+                    "input_type": e.input_type, "tags": (e.tags or [])[:3], "build_status": e.build_status}
+        return jsonify({"same_author": [mini(e) for e in same_author],
+                        "similar": [mini(e) for e in similar], "viewer": bool(viewer)}), 200
+    except Exception as e:
+        print(f"related_entries error: {e}", file=sys.stderr)
+        return jsonify({"same_author": [], "similar": []}), 200
 
 
 # ---- Views ----
@@ -2570,7 +2863,7 @@ def get_public_profile(user_id):
 
         return jsonify({
             "id": user.id,
-            "name": user.name or user.email.split('@')[0],
+            "name": user.name or 'Builder',
             "bio": user.bio,
             "avatar_url": user.avatar_url,
             "github_url": user.github_url,
@@ -2613,7 +2906,7 @@ def toggle_follow(user_id):
                 id=str(uuid.uuid4()),
                 user_id=user_id,
                 type='follow',
-                title=f"{g.user_name or g.user_email.split('@')[0]} started following you",
+                title=f"{g.user_name or 'Someone'} started following you",
                 message=None,
                 link=f'/profile/{g.user_id}',
             )
@@ -2675,7 +2968,7 @@ def _viewer_following_set():
 def _user_card(u, viewer_id, following_set):
     return {
         "id": u.id,
-        "name": u.name or (u.email.split('@')[0] if u.email else 'Builder'),
+        "name": u.name or 'Builder',
         "avatar_url": u.avatar_url,
         "bio": u.bio,
         "is_following": u.id in following_set,
@@ -2723,7 +3016,7 @@ def my_collaborations():
                 "visibility": e.visibility,
             }
             if owner is not None:
-                card["owner"] = {"id": owner.id, "name": owner.name or owner.email.split('@')[0], "avatar_url": owner.avatar_url}
+                card["owner"] = {"id": owner.id, "name": owner.name or 'Builder', "avatar_url": owner.avatar_url}
             if role is not None:
                 card["role"] = role
             if members is not None:
@@ -2748,7 +3041,7 @@ def my_collaborations():
                     .join(User, Collaborator.user_id == User.id) \
                     .filter(Collaborator.catalog_entry_id.in_(my_ids)).all():
                 member_map.setdefault(eid, []).append({
-                    "id": u.id, "name": u.name or u.email.split('@')[0], "avatar_url": u.avatar_url, "role": role,
+                    "id": u.id, "name": u.name or 'Builder', "avatar_url": u.avatar_url, "role": role,
                 })
         my_projects = [entry_card(e, members=member_map[e.id]) for e in my_entries if e.id in member_map]
 
@@ -2913,9 +3206,9 @@ def toggle_reaction(entry_id):
                     id=str(uuid.uuid4()),
                     user_id=entry.user_id,
                     type='reaction',
-                    title=f"{g.user_name or g.user_email.split('@')[0]} reacted {emoji_map.get(reaction_type, '')} to your idea",
+                    title=f"{g.user_name or 'Someone'} reacted {emoji_map.get(reaction_type, '')} to your idea",
                     message=entry.raw_input[:100],
-                    link=f'/community?post={entry_id}',
+                    link=f'/idea/{entry_id}',
                 )
                 db.session.add(notif)
                 db.session.commit()
@@ -2935,7 +3228,7 @@ def toggle_reaction(entry_id):
                     type='milestone',
                     title=f"🎉 Your idea just hit {total} reactions!",
                     message=entry.raw_input[:100],
-                    link=f'/community?post={entry_id}',
+                    link=f'/idea/{entry_id}',
                 )
                 db.session.add(milestone)
                 db.session.commit()
@@ -2971,7 +3264,7 @@ def list_reactors(entry_id):
             if len(bucket) < 30:
                 bucket.append({
                     "id": u.id,
-                    "name": u.name or (u.email.split('@')[0] if u.email else 'Builder'),
+                    "name": u.name or 'Builder',
                     "avatar_url": u.avatar_url,
                 })
         return jsonify(grouped), 200
@@ -3039,7 +3332,7 @@ def send_connect_request(entry_id):
             id=str(uuid.uuid4()),
             user_id=entry.user_id,
             type='connect_request',
-            title=f"{g.user_name or g.user_email.split('@')[0]} wants to collaborate as {role_labels.get(role, role)}",
+            title=f"{g.user_name or 'Someone'} wants to collaborate as {role_labels.get(role, role)}",
             message=f'On: {entry.raw_input[:80]}' + (f' — "{message[:100]}"' if message else ''),
             link='/dashboard?tab=requests',
         )
@@ -3076,7 +3369,7 @@ def get_incoming_requests():
                 "idea_id": r.catalog_entry_id,
                 "requester": {
                     "id": requester.id,
-                    "name": requester.name or requester.email.split('@')[0],
+                    "name": requester.name or 'Builder',
                     "email": requester.email if r.status == 'accepted' else None,
                     "avatar_url": requester.avatar_url,
                     "github_url": requester.github_url if r.status == 'accepted' else None,
@@ -3108,7 +3401,7 @@ def get_sent_requests():
                 "idea_id": r.catalog_entry_id,
                 "owner": {
                     "id": owner.id,
-                    "name": owner.name or owner.email.split('@')[0],
+                    "name": owner.name or 'Builder',
                     "email": owner.email if r.status == 'accepted' else None,
                     "avatar_url": owner.avatar_url,
                     "github_url": owner.github_url if r.status == 'accepted' else None,

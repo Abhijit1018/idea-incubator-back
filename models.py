@@ -45,6 +45,12 @@ class CatalogEntry(db.Model):
     tags = db.Column(db.JSON, nullable=True)
     visible_fields = db.Column(db.JSON, nullable=True)  # List of field names visible when published; null = show all
     remixed_from = db.Column(db.String(36), nullable=True)  # source entry id when this was forked/remixed
+    # AI-written display title + one-line hook (raw_input is the user's prompt, not a title).
+    title = db.Column(db.String(120), nullable=True)
+    tagline = db.Column(db.String(200), nullable=True)
+    # Owner-set progress + who they need, so Connect requests are meaningful.
+    build_status = db.Column(db.String(20), nullable=True)   # exploring | building | launched
+    looking_for = db.Column(db.JSON, nullable=True)          # subset of CONNECT_ROLES
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -90,6 +96,7 @@ class Comment(db.Model):
     content = db.Column(db.Text, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    edited = db.Column(db.Boolean, default=False)
 
     # Relationships
     catalog_entry = db.relationship('CatalogEntry', backref=db.backref('comments', lazy=True, order_by='Comment.created_at'))
@@ -216,6 +223,26 @@ class WorkspaceNote(db.Model):
 
 
 TASK_STATUSES = ['todo', 'doing', 'done']
+
+BUILD_STATUSES = ['exploring', 'building', 'launched']
+
+# "Would you use it?" + "What would you pay per month (INR)?" — structured
+# market signal for the idea owner, instead of only emoji-style reactions.
+VALIDATION_USE = ['yes', 'maybe', 'no']
+VALIDATION_PAY_TIERS = [0, 99, 499, 1999]   # ₹ per month; 1999 means "₹1,999+"
+
+
+class IdeaValidation(db.Model):
+    __tablename__ = 'idea_validations'
+    id = db.Column(db.String(36), primary_key=True, default=generate_uuid)
+    catalog_entry_id = db.Column(db.String(36), db.ForeignKey('catalog_entries.id'), nullable=False)
+    user_id = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=False)
+    would_use = db.Column(db.String(10), nullable=False)
+    pay_tier = db.Column(db.Integer, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (db.UniqueConstraint('catalog_entry_id', 'user_id', name='uq_validation_user_entry'),)
 
 
 class Follow(db.Model):
