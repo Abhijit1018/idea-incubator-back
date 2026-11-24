@@ -95,8 +95,15 @@ engine_options = {
 
 if db_uri.startswith('postgresql'):
     print("Detected PostgreSQL - adding SSL and pool options", file=sys.stderr)
-    engine_options['pool_size'] = 10
-    engine_options['max_overflow'] = 20
+    # Supabase's Supavisor pooler in SESSION mode (port 5432) caps a project at
+    # 15 client connections. 10+20 let threaded Gunicorn open up to 30 and get
+    # "EMAXCONNSESSION max clients reached" 500s under load. Stay well below 15
+    # (leave room for n8n / the dashboard) and make extra requests wait briefly
+    # for a free connection instead of failing. Raise via env if you switch to
+    # the transaction-mode pooler (port 6543), which allows far more clients.
+    engine_options['pool_size'] = int(os.getenv('DB_POOL_SIZE', '6'))
+    engine_options['max_overflow'] = int(os.getenv('DB_MAX_OVERFLOW', '4'))
+    engine_options['pool_timeout'] = int(os.getenv('DB_POOL_TIMEOUT', '20'))
     engine_options['connect_args'] = {
         'connect_timeout': 15,
         'sslmode': 'require'
@@ -1681,7 +1688,7 @@ def compute_idea_score(entry_id):
 # could demand 100+ DB connections at once (pool is 30, Supabase caps lower).
 from concurrent.futures import ThreadPoolExecutor as _TPE
 import contextlib as _contextlib
-_SERIALIZE_POOL = _TPE(max_workers=8, thread_name_prefix='serialize')
+_SERIALIZE_POOL = _TPE(max_workers=int(os.getenv('SERIALIZE_WORKERS', '4')), thread_name_prefix='serialize')
 
 
 def _validation_summary(rows_use, rows_pay):
