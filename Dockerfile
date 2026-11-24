@@ -12,4 +12,5 @@ COPY . .
 
 EXPOSE 5000
 
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-5000} --workers ${WEB_CONCURRENCY:-1} app:app"]
+# Worker class, threads, bind and timeouts live in gunicorn.conf.py (auto-loaded).
+CMD ["gunicorn", "app:app"]

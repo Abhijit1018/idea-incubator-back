@@ -14,6 +14,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from dotenv import load_dotenv
 import threading
 import time
+import hmac
 from datetime import timedelta
 
 Pinecone = None
@@ -53,10 +54,16 @@ if ENABLE_VECTOR_SEARCH and pinecone_api_key and Pinecone and ServerlessSpec:
         print(f"Pinecone initialization failed: {e}")
 
 app = Flask(__name__)
+_PROCESS_STARTED = time.time()
 
 def normalize_database_url(database_url):
+    # Pin the driver explicitly: SQLAlchemy 2.1 changed the default for a bare
+    # postgresql:// URL from psycopg2 to psycopg (v3), which isn't installed —
+    # a fresh build crashed at boot with "No module named 'psycopg'".
     if database_url.startswith('postgres://'):
-        return database_url.replace('postgres://', 'postgresql://', 1)
+        return database_url.replace('postgres://', 'postgresql+psycopg2://', 1)
+    if database_url.startswith('postgresql://'):
+        return database_url.replace('postgresql://', 'postgresql+psycopg2://', 1)
     return database_url
 
 cors_origins_raw = os.getenv('CORS_ALLOWED_ORIGINS', '').strip()
@@ -327,14 +334,81 @@ SUPABASE_ANON_KEY = os.getenv('SUPABASE_ANON_KEY', '')
 # When set, tokens are verified locally (no network round-trip per request).
 SUPABASE_JWT_SECRET = os.getenv('SUPABASE_JWT_SECRET', '')
 
+# Shared secret n8n must send (X-Webhook-Secret header) on every callback into
+# this backend. Without it, the callback endpoints are open to anyone who knows
+# an entry id — and public entry ids are visible in the community feed.
+N8N_WEBHOOK_SECRET = os.getenv('N8N_WEBHOOK_SECRET', '').strip()
+if not N8N_WEBHOOK_SECRET:
+    print("WARNING: N8N_WEBHOOK_SECRET not set — n8n callbacks only protected by "
+          "entry-state checks. Set it on the server AND in the n8n HTTP nodes.", file=sys.stderr)
+
+
+def webhook_secret_ok():
+    """True when the request carries the configured n8n shared secret.
+    If no secret is configured, allows the call (state checks still apply)."""
+    if not N8N_WEBHOOK_SECRET:
+        return True
+    supplied = request.headers.get('X-Webhook-Secret', '')
+    return hmac.compare_digest(supplied.encode(), N8N_WEBHOOK_SECRET.encode())
+
+
+def n8n_headers():
+    """Headers for outbound calls to n8n, so n8n can verify the caller too."""
+    return {'X-Webhook-Secret': N8N_WEBHOOK_SECRET} if N8N_WEBHOOK_SECRET else {}
+
+
 try:
     import jwt as _pyjwt
 except Exception:
     _pyjwt = None
 
+from cachetools import TTLCache as _BaseTTLCache
+
+
+class TTLCache(_BaseTTLCache):
+    """cachetools caches are not thread-safe, and Gunicorn now runs threaded
+    workers. Serialize every access with one lock per cache."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._lock = threading.RLock()
+
+    def __getitem__(self, key):
+        with self._lock:
+            return super().__getitem__(key)
+
+    def __setitem__(self, key, value):
+        with self._lock:
+            super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        with self._lock:
+            super().__delitem__(key)
+
+    def __contains__(self, key):
+        with self._lock:
+            return super().__contains__(key)
+
+    def get(self, key, default=None):
+        with self._lock:
+            return super().get(key, default)
+
+    def pop(self, key, *args):
+        with self._lock:
+            return super().pop(key, *args)
+
+    def clear(self):
+        with self._lock:
+            super().clear()
+
+
 # Bounded, self-expiring cache (token -> user dict). Avoids unbounded growth.
-from cachetools import TTLCache as _TTLCache
-_auth_cache = _TTLCache(maxsize=5000, ttl=300)  # 5 minutes
+_auth_cache = TTLCache(maxsize=5000, ttl=300)  # 5 minutes
+
+# User ids deleted in this process. Their JWTs stay cryptographically valid
+# until expiry (~1h), and auth_required auto-creates unknown users — without
+# this, any in-flight request right after deletion would resurrect the account.
+_deleted_user_ids = TTLCache(maxsize=10000, ttl=7200)
 
 
 def _verify_jwt_local(token):
@@ -408,6 +482,8 @@ def auth_required(f):
 
         # Sync user to our DB (create if not exists)
         supabase_id = supabase_user.get('id')
+        if supabase_id in _deleted_user_ids:
+            return jsonify({"error": "Account deleted"}), 401
         email = supabase_user.get('email', '')
         name = supabase_user.get('user_metadata', {}).get('name', '')
 
@@ -519,7 +595,10 @@ def keepalive():
     except Exception as e:
         db.session.rollback()
         print(f"Keepalive DB ping failed: {e}", file=sys.stderr)
-    return jsonify({"status": "ok", "db": db_ok, "ts": datetime.utcnow().isoformat()}), 200
+    # uptime_s lets an external check prove the instance is staying warm:
+    # if it keeps growing across pings, Render never spun it down.
+    return jsonify({"status": "ok", "db": db_ok, "ts": datetime.utcnow().isoformat(),
+                    "uptime_s": int(time.time() - _PROCESS_STARTED)}), 200
 
 @app.route('/api/stats', methods=['GET'])
 def public_stats():
@@ -562,30 +641,77 @@ def public_stats():
 @app.route('/api/account/delete', methods=['DELETE'])
 @auth_required
 def delete_account():
+    """Erase the user and everything they own, in one transaction.
+
+    No FK in the schema has ON DELETE CASCADE, so every row that references
+    the user OR one of their ideas must go first — including other people's
+    likes/comments/reactions on those ideas. Missing any one of these makes
+    Postgres reject the delete with an FK violation."""
     user_id = g.user_id
     try:
-        Notification.query.filter_by(user_id=user_id).delete()
+        owned_ids = [r[0] for r in db.session.query(CatalogEntry.id).filter_by(user_id=user_id).all()]
+        on_owned = (lambda col: col.in_(owned_ids)) if owned_ids else (lambda col: db.false())
+        sync = dict(synchronize_session=False)
+
+        # Comments: detach replies (by others, elsewhere) that point at a comment
+        # we are about to delete, so the self-referencing FK doesn't block us.
+        doomed_comment_ids = [r[0] for r in db.session.query(Comment.id).filter(
+            (Comment.user_id == user_id) | on_owned(Comment.catalog_entry_id)).all()]
+        if doomed_comment_ids:
+            Comment.query.filter(Comment.parent_id.in_(doomed_comment_ids)).update(
+                {Comment.parent_id: None}, **sync)
+            Comment.query.filter(Comment.id.in_(doomed_comment_ids)).delete(**sync)
+
+        # Rows authored by the user anywhere, or attached to the user's ideas.
+        for model in (Like, Bookmark, Reaction, ChatMessage, IdeaUpdate):
+            model.query.filter((model.user_id == user_id) | on_owned(model.catalog_entry_id)).delete(**sync)
+        Collaborator.query.filter((Collaborator.user_id == user_id) | on_owned(Collaborator.catalog_entry_id)).delete(**sync)
         ConnectRequest.query.filter(
             (ConnectRequest.requester_id == user_id) | (ConnectRequest.owner_id == user_id)
-        ).delete(synchronize_session=False)
-        Collaborator.query.filter_by(user_id=user_id).delete()
-        IdeaUpdate.query.filter(
-            IdeaUpdate.catalog_entry_id.in_(
-                db.session.query(CatalogEntry.id).filter_by(user_id=user_id)
-            )
-        ).delete(synchronize_session=False)
-        Reaction.query.filter_by(user_id=user_id).delete()
-        Bookmark.query.filter_by(user_id=user_id).delete()
-        Comment.query.filter_by(user_id=user_id).delete()
-        ChatMessage.query.filter_by(user_id=user_id).delete()
-        CatalogEntry.query.filter_by(user_id=user_id).delete()
-        User.query.filter_by(id=user_id).delete()
+            | on_owned(ConnectRequest.catalog_entry_id)).delete(**sync)
+        CatalogEmbedding.query.filter(on_owned(CatalogEmbedding.catalog_entry_id)).delete(**sync)
+        WorkspaceTask.query.filter(on_owned(WorkspaceTask.catalog_entry_id)).delete(**sync)
+        WorkspaceNote.query.filter(on_owned(WorkspaceNote.catalog_entry_id)).delete(**sync)
+        # Keep collaborators' work on OTHER ideas, just un-attribute it.
+        WorkspaceTask.query.filter_by(created_by=user_id).update({WorkspaceTask.created_by: None}, **sync)
+        WorkspaceNote.query.filter_by(updated_by=user_id).update({WorkspaceNote.updated_by: None}, **sync)
+        Follow.query.filter((Follow.follower_id == user_id) | (Follow.following_id == user_id)).delete(**sync)
+        Notification.query.filter_by(user_id=user_id).delete(**sync)
+
+        CatalogEntry.query.filter_by(user_id=user_id).delete(**sync)
+        User.query.filter_by(id=user_id).delete(**sync)
         db.session.commit()
-        return jsonify({'message': 'Account deleted'}), 200
     except Exception as e:
         db.session.rollback()
-        print(f"Account delete error for {user_id}: {e}")
+        print(f"Account delete error for {user_id}: {e}", file=sys.stderr)
         return jsonify({'error': 'Failed to delete account'}), 500
+
+    # Drop cached tokens + feed caches so the deleted user can't keep acting
+    # on a still-valid JWT and their ideas vanish from the feed immediately.
+    _deleted_user_ids[user_id] = True
+    _auth_cache.clear()
+    feed_cache.clear()
+    _leaderboard_cache.clear()
+
+    # Also delete the Supabase Auth identity (email / Google login), otherwise
+    # signing in again silently recreates the account. Needs the service key.
+    auth_deleted = False
+    service_key = os.getenv('SUPABASE_SERVICE_ROLE_KEY', '')
+    if service_key:
+        try:
+            r = http_requests.delete(
+                f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+                headers={"apikey": service_key, "Authorization": f"Bearer {service_key}"},
+                timeout=10.0)
+            auth_deleted = r.status_code in (200, 204, 404)
+            if not auth_deleted:
+                print(f"Supabase auth delete failed {r.status_code}: {r.text[:200]}", file=sys.stderr)
+        except Exception as e:
+            print(f"Supabase auth delete error: {e}", file=sys.stderr)
+    else:
+        print("SUPABASE_SERVICE_ROLE_KEY not set — auth identity not deleted", file=sys.stderr)
+
+    return jsonify({'message': 'Account deleted', 'auth_deleted': auth_deleted}), 200
 
 
 def background_retry_job(app):
@@ -615,7 +741,7 @@ def background_retry_job(app):
                     db.session.commit()
                     
                     try:
-                        http_requests.post(N8N_WEBHOOK_URL, json={
+                        http_requests.post(N8N_WEBHOOK_URL, headers=n8n_headers(), json={
                             "entry_id": entry.id, 
                             "raw_input": entry.raw_input, 
                             "input_type": entry.input_type
@@ -642,12 +768,17 @@ def background_retry_job(app):
 @limiter.limit("30 per hour; 5 per minute")
 @auth_required
 def submit_idea():
-    data = request.json
-    raw_input = data.get('raw_input')
+    data = request.get_json(silent=True) or {}
+    raw_input = (data.get('raw_input') or '').strip()
     input_type = data.get('input_type', 'idea')
-    
+
     if not raw_input:
         return jsonify({"error": "raw_input is required"}), 400
+    # Column is VARCHAR(500): longer input used to crash the insert with a 500.
+    if len(raw_input) > 500:
+        return jsonify({"error": "Idea is too long (max 500 characters)"}), 400
+    if input_type not in ('idea', 'tool'):
+        input_type = 'idea'
 
     entry_id = str(uuid.uuid4())
     new_entry = CatalogEntry(
@@ -661,7 +792,7 @@ def submit_idea():
     db.session.commit()
 
     try:
-        http_requests.post(N8N_WEBHOOK_URL, json={"entry_id": entry_id, "raw_input": raw_input, "input_type": input_type}, timeout=5.0)
+        http_requests.post(N8N_WEBHOOK_URL, headers=n8n_headers(), json={"entry_id": entry_id, "raw_input": raw_input, "input_type": input_type}, timeout=5.0)
     except http_requests.exceptions.ReadTimeout:
         pass
     except http_requests.exceptions.RequestException as e:
@@ -694,14 +825,26 @@ def get_catalogs():
 
 @app.route('/api/webhooks/n8n-callback', methods=['POST'])
 def n8n_callback():
+    if not webhook_secret_ok():
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
     try:
         # 1. Catch the standard text strings from the form data
         entry_id = request.form.get('entry_id')
         summary = request.form.get('summary')
         mermaid_syntax = request.form.get('mermaid_syntax', '')
-        
+
         if not entry_id:
             return jsonify({"status": "error", "message": "entry_id is required"}), 400
+
+        # Look the entry up BEFORE doing any work (image upload etc.), and only
+        # accept results for an entry that is actually awaiting the pipeline.
+        # A completed entry is never overwritten by a callback — that is what
+        # stops a forged callback from defacing a published idea.
+        entry = CatalogEntry.query.get(entry_id)
+        if not entry:
+            return jsonify({"status": "error", "message": "CatalogEntry not found"}), 404
+        if entry.status not in ('pending', 'failed'):
+            return jsonify({"status": "error", "message": "Entry is not awaiting results"}), 409
 
         # 2. Catch and parse the JSON-stringified arrays/objects
         def safe_json_loads(key):
@@ -762,20 +905,23 @@ def n8n_callback():
                 image_file.save(file_path)
                 image_url = f"{get_public_backend_base_url()}/static/uploads/{unique_filename}"
 
-        # 5. Placeholder comment for database update logic
-        # TODO: Add your SQLAlchemy (or standard SQL) database update logic using the entry_id here
-        
-        # Actual Implementation:
-        entry = CatalogEntry.query.get(entry_id)
-        if not entry:
-            return jsonify({"status": "error", "message": "CatalogEntry not found"}), 404
-
+        # 5. Persist results (entry was looked up and state-checked above)
         entry.status = "completed"
         entry.summary = summary
         entry.tech_stack = tech_stack
         entry.pros_cons = pros_cons
         entry.similar_tools = similar_tools
-        
+
+        # Tags were parsed but never saved before, so tag explore was always empty.
+        if isinstance(tags, list):
+            clean_tags = []
+            for t in tags:
+                t = str(t).strip().lstrip('#').lower()[:40]
+                if t and t not in clean_tags:
+                    clean_tags.append(t)
+            if clean_tags:
+                entry.tags = clean_tags[:8]
+
         entry.creator = creator
         entry.link = link
         entry.installation = installation
@@ -886,29 +1032,34 @@ def get_chat_messages(entry_id):
 
 
 @app.route('/api/catalogs/<entry_id>/chat', methods=['POST'])
+@auth_required
 def send_chat_message(entry_id):
-    """Send a new chat message for a catalog entry (called by frontend and n8n callback)"""
+    """Persist a chat message (used by the frontend for system messages).
+    Was unauthenticated and trusted a user_id from the body — anyone could
+    write into any idea's chat as anyone. Now: caller must be owner or
+    collaborator, and the author is always the verified caller."""
     try:
-        data = request.json
-        message_text = data.get('message')
-        is_user = data.get('is_user', True)
-        user_id = data.get('user_id')
-        
+        data = request.get_json(silent=True) or {}
+        message_text = (data.get('message') or '').strip()
+        is_user = bool(data.get('is_user', True))
+
         if not message_text:
             return jsonify({"error": "message is required"}), 400
+        if len(message_text) > 4000:
+            return jsonify({"error": "message too long"}), 400
+        # Non-user rows may only be client system notices, never fake AI replies
+        # (those could carry proposed_changes the owner might apply).
+        if not is_user and not message_text.startswith('SYSTEM_MESSAGE::'):
+            return jsonify({"error": "Only system messages may be posted as non-user"}), 400
 
-        # Require a real, existing user — never silently attribute to a random account.
-        if not user_id:
-            return jsonify({"error": "user_id is required"}), 400
-        db_user = User.query.filter_by(id=user_id).first()
-        if not db_user:
-            return jsonify({"error": "Unknown user_id"}), 400
-
-        # Verify catalog entry exists
         entry = CatalogEntry.query.get(entry_id)
         if not entry:
             return jsonify({"error": "Catalog entry not found"}), 404
-        
+        is_collab = Collaborator.query.filter_by(user_id=g.user_id, catalog_entry_id=entry_id).first()
+        if entry.user_id != g.user_id and not is_collab:
+            return jsonify({"error": "Unauthorized"}), 403
+        db_user = User.query.get(g.user_id)
+
         new_message = ChatMessage(
             id=str(uuid.uuid4()),
             catalog_entry_id=entry_id,
@@ -931,14 +1082,17 @@ def send_chat_message(entry_id):
 
 
 @app.route('/api/catalogs/<entry_id>/generate-embedding', methods=['POST'])
+@auth_required
 def generate_catalog_embedding(entry_id):
-    """Generate and store vector embedding for a catalog entry"""
+    """Generate and store vector embedding for a catalog entry (owner only)."""
     try:
         # Get the catalog entry
         entry = CatalogEntry.query.get(entry_id)
         if not entry:
             return jsonify({"error": "Catalog entry not found"}), 404
-        
+        if entry.user_id != g.user_id:
+            return jsonify({"error": "Unauthorized"}), 403
+
         # Create text representation of the catalog entry for embedding
         text_parts = [
             entry.raw_input or "",
@@ -1130,7 +1284,18 @@ def chat_message_webhook():
         db_user = User.query.filter_by(id=user_id).first()
         if not db_user:
             return jsonify({"error": "Authenticated user not found"}), 401
-        
+
+        if len(str(user_message)) > 4000:
+            return jsonify({"error": "message too long"}), 400
+        # Only the owner or a collaborator may chat on an idea (was: anyone
+        # signed in, on any idea — including private ones).
+        target = CatalogEntry.query.get(entry_id)
+        if not target:
+            return jsonify({"error": "Catalog entry not found"}), 404
+        if target.user_id != user_id and not Collaborator.query.filter_by(
+                user_id=user_id, catalog_entry_id=entry_id).first():
+            return jsonify({"error": "Unauthorized"}), 403
+
         # Store user message with valid user_id
         try:
             user_chat = ChatMessage(
@@ -1173,6 +1338,7 @@ def chat_message_webhook():
             try:
                 n8n_response = http_requests.post(
                     N8N_CHAT_WEBHOOK_URL,
+                    headers=n8n_headers(),
                     json=n8n_payload,
                     timeout=10.0
                 )
@@ -1287,7 +1453,7 @@ def regenerate_entry(entry_id):
         db.session.commit()
 
         try:
-            http_requests.post(N8N_WEBHOOK_URL, json={
+            http_requests.post(N8N_WEBHOOK_URL, headers=n8n_headers(), json={
                 "entry_id": entry.id,
                 "raw_input": entry.raw_input,
                 "input_type": entry.input_type,
@@ -1358,22 +1524,41 @@ def update_catalog_entry(entry_id):
 @app.route('/api/webhooks/chat-response', methods=['POST'])
 def chat_response_webhook():
     """Callback from n8n with AI chat response. May include proposed_changes."""
+    if not webhook_secret_ok():
+        return jsonify({"error": "Unauthorized"}), 401
     try:
         data = request.get_json(silent=True)
         if not data:
             return jsonify({"error": "No JSON data"}), 400
-        
+
         entry_id = data.get('entry_id')
         ai_message = data.get('message', '')
         proposed_changes = data.get('proposed_changes')  # optional dict
-        
+
         if not entry_id or not ai_message:
             return jsonify({"error": "entry_id and message are required"}), 400
-        
+
         entry = CatalogEntry.query.get(entry_id)
         if not entry:
             return jsonify({"error": "Catalog entry not found"}), 404
-        
+
+        # Only accept a reply when a user message is actually waiting for one:
+        # the latest message must be from a user and recent. Blocks forged
+        # "AI" messages / proposed edits being injected into someone's chat.
+        # (Client-persisted SYSTEM_MESSAGE rows don't count as an AI reply.)
+        last_user_msg = (ChatMessage.query.filter_by(catalog_entry_id=entry_id, is_user=True)
+                         .order_by(ChatMessage.created_at.desc()).first())
+        if not last_user_msg or (datetime.utcnow() - last_user_msg.created_at) > timedelta(minutes=10):
+            return jsonify({"error": "No pending chat message for this entry"}), 409
+        already_answered = ChatMessage.query.filter(
+            ChatMessage.catalog_entry_id == entry_id,
+            ChatMessage.is_user.is_(False),
+            ChatMessage.created_at >= last_user_msg.created_at,
+            ~ChatMessage.message.like('SYSTEM_MESSAGE::%'),
+        ).first()
+        if already_answered:
+            return jsonify({"error": "Chat message already answered"}), 409
+
         # Get the entry owner as the user for this message
         owner_id = entry.user_id
         
@@ -1618,15 +1803,16 @@ def serialize_entry(e, user_id=None):
 
 
 import time
-from cachetools import TTLCache
 feed_cache = TTLCache(maxsize=100, ttl=15.0)
+_leaderboard_cache = TTLCache(maxsize=1, ttl=120.0)
 
 @app.route('/api/community/feed', methods=['GET'])
 def community_feed():
     """Public community feed — returns published entries with 15s cache."""
     try:
-        page = request.args.get('page', 1, type=int)
-        per_page = request.args.get('per_page', 20, type=int)
+        page = max(1, request.args.get('page', 1, type=int) or 1)
+        # Cap page size: an unbounded per_page let one request serialize the whole table.
+        per_page = min(max(1, request.args.get('per_page', 20, type=int) or 20), 50)
         sort = request.args.get('sort', 'recent')  # recent | popular | trending
         filter_type = request.args.get('type', 'all')  # all | idea | tool
         search = request.args.get('q', '').strip()
@@ -1688,11 +1874,15 @@ def community_feed():
 
             serialized.sort(key=trend_score, reverse=True)
             total = len(serialized)
-            pages = max(1, (total + per_page - 1) // per_page)
-            start = (page - 1) * per_page
-            result = serialized[start:start + per_page]
-            feed_cache[cache_key] = {"entries": result, "total": total, "pages": pages, "page": page, "per_page": per_page}
-            return jsonify({"entries": result, "total": total, "page": page, "per_page": per_page, "pages": pages}), 200
+            if total:
+                pages = max(1, (total + per_page - 1) // per_page)
+                start = (page - 1) * per_page
+                result = serialized[start:start + per_page]
+                feed_cache[cache_key] = {"entries": result, "total": total, "pages": pages, "page": page, "per_page": per_page}
+                return jsonify({"entries": result, "total": total, "page": page, "per_page": per_page, "pages": pages}), 200
+            # Nothing published in the trending window (quiet periods / early
+            # launch): fall back to "popular" rather than an empty tab.
+            sort = 'popular'
 
         if ranked:
             # Relevance ordering already applied by apply_search; recency as tiebreak.
@@ -1846,42 +2036,55 @@ def remix_entry(entry_id):
 
 @app.route('/api/community/leaderboard', methods=['GET'])
 def community_leaderboard():
-    """Returns top users based on community activity."""
+    """Returns top users based on community activity.
+
+    Was 4 queries per user, uncached (~7s at 14 users, growing linearly).
+    Now 4 GROUP BY queries total + a 2-minute cache."""
+    cached = _leaderboard_cache.get('top')
+    if cached is not None:
+        return jsonify(cached), 200
     try:
-        users = User.query.all()
+        func = db.func
+        pub = dict(db.session.query(CatalogEntry.user_id, func.count(CatalogEntry.id))
+                   .filter(CatalogEntry.visibility == 'public')
+                   .group_by(CatalogEntry.user_id).all())
+        upd = dict(db.session.query(IdeaUpdate.user_id, func.count(IdeaUpdate.id))
+                   .group_by(IdeaUpdate.user_id).all())
+        likes = dict(db.session.query(CatalogEntry.user_id, func.count(Like.id))
+                     .join(Like, Like.catalog_entry_id == CatalogEntry.id)
+                     .group_by(CatalogEntry.user_id).all())
+        reacts = dict(db.session.query(CatalogEntry.user_id, func.count(Reaction.id))
+                      .join(Reaction, Reaction.catalog_entry_id == CatalogEntry.id)
+                      .group_by(CatalogEntry.user_id).all())
+
+        scores = {}
+        for uid in set(pub) | set(upd) | set(likes) | set(reacts):
+            s = pub.get(uid, 0) * 10 + upd.get(uid, 0) * 5 + likes.get(uid, 0) * 2 + reacts.get(uid, 0)
+            if s > 0:
+                scores[uid] = s
+        top_ids = sorted(scores, key=scores.get, reverse=True)[:10]
+        users = {u.id: u for u in User.query.filter(User.id.in_(top_ids)).all()} if top_ids else {}
+
         leaderboard = []
-        
-        for u in users:
-            score = 0
-            pub_count = CatalogEntry.query.filter_by(user_id=u.id, visibility='public').count()
-            score += pub_count * 10
-            
-            update_count = IdeaUpdate.query.filter_by(user_id=u.id).count()
-            score += update_count * 5
-            
-            entry_ids = [e.id for e in CatalogEntry.query.filter_by(user_id=u.id).all()]
-            if entry_ids:
-                likes_received = Like.query.filter(Like.catalog_entry_id.in_(entry_ids)).count()
-                score += likes_received * 2
-                
-                reactions_received = Reaction.query.filter(Reaction.catalog_entry_id.in_(entry_ids)).count()
-                score += reactions_received * 1
-            
-            if score > 0 or pub_count > 0:
-                leaderboard.append({
-                    "id": u.id,
-                    "name": u.name or u.email.split('@')[0],
-                    "avatar_url": u.avatar_url,
-                    "score": score,
-                    "published_count": pub_count,
-                    "updates_count": update_count
-                })
-        
-        leaderboard.sort(key=lambda x: x['score'], reverse=True)
-        return jsonify(leaderboard[:10]), 200
+        for uid in top_ids:
+            u = users.get(uid)
+            if not u:
+                continue
+            leaderboard.append({
+                "id": u.id,
+                # Never fall back to the email address — it is private.
+                "name": u.name or "Builder",
+                "avatar_url": u.avatar_url,
+                "score": scores[uid],
+                "published_count": pub.get(uid, 0),
+                "updates_count": upd.get(uid, 0),
+            })
+        _leaderboard_cache['top'] = leaderboard
+        return jsonify(leaderboard), 200
     except Exception as e:
-        print(f"Leaderboard error: {e}")
-        return jsonify({"error": str(e)}), 500
+        db.session.rollback()
+        print(f"Leaderboard error: {e}", file=sys.stderr)
+        return jsonify({"error": "Could not load leaderboard"}), 500
 
 
 @app.route('/api/catalogs/<entry_id>/updates', methods=['GET'])
@@ -3209,16 +3412,27 @@ def mark_notifications_read():
         return jsonify({"error": str(e)}), 500
 
 
-# Production Startup Sequence (runs during Gunicorn import)
-with app.app_context():
-    try:
-        init_db()
+# Production Startup Sequence (runs during Gunicorn import).
+# DB init (create_all + migrations + indexes + RLS + realtime policies) is
+# dozens of round-trips to Supabase. It used to run BEFORE Gunicorn bound the
+# port, adding to every cold start. The schema already exists in prod and every
+# step is idempotent, so run it in the background and start serving at once.
+def _startup_background():
+    with app.app_context():
+        try:
+            init_db()
+        except Exception as e:
+            print(f"Startup DB init failed: {e}", file=sys.stderr)
+    background_retry_job(app)
 
-        # Start background thread
-        retry_thread = threading.Thread(target=background_retry_job, args=(app,), daemon=True)
-        retry_thread.start()
-    except Exception as e:
-        print(f"Startup sequence failed: {e}", file=sys.stderr)
+
+if os.getenv('SYNC_DB_INIT', 'false').lower() == 'true':
+    # Opt-in synchronous init (fresh database / local first run).
+    with app.app_context():
+        init_db()
+    threading.Thread(target=background_retry_job, args=(app,), daemon=True).start()
+else:
+    threading.Thread(target=_startup_background, daemon=True).start()
 
 
 if __name__ == '__main__':
