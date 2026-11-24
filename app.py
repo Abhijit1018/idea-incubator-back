@@ -522,6 +522,19 @@ def get_public_backend_base_url():
         return BACKEND_BASE_URL
     return request.host_url.rstrip('/')
 
+
+def n8n_callback_base():
+    """Base URL n8n should call back to. Sent with every n8n trigger so ONE
+    workflow serves whichever backend called it (local dev or Render prod).
+    Safe because n8n's trigger webhooks require the shared secret, so only
+    our backend can choose the callback target. Empty (n8n falls back to its
+    default prod URL) when there is no request context, e.g. the retry thread
+    without BACKEND_BASE_URL set."""
+    from flask import has_request_context
+    if BACKEND_BASE_URL:
+        return BACKEND_BASE_URL
+    return request.host_url.rstrip('/') if has_request_context() else ''
+
 @app.route('/')
 def root_status():
     return jsonify({
@@ -744,7 +757,8 @@ def background_retry_job(app):
                         http_requests.post(N8N_WEBHOOK_URL, headers=n8n_headers(), json={
                             "entry_id": entry.id, 
                             "raw_input": entry.raw_input, 
-                            "input_type": entry.input_type
+                            "input_type": entry.input_type,
+                            "callback_base": n8n_callback_base(),
                         }, timeout=5.0)
                     except http_requests.exceptions.RequestException as e:
                         print(f"Error triggering n8n webhook on retry: {e}")
@@ -792,7 +806,8 @@ def submit_idea():
     db.session.commit()
 
     try:
-        http_requests.post(N8N_WEBHOOK_URL, headers=n8n_headers(), json={"entry_id": entry_id, "raw_input": raw_input, "input_type": input_type}, timeout=5.0)
+        http_requests.post(N8N_WEBHOOK_URL, headers=n8n_headers(), json={"entry_id": entry_id, "raw_input": raw_input, "input_type": input_type,
+                                 "callback_base": n8n_callback_base()}, timeout=5.0)
     except http_requests.exceptions.ReadTimeout:
         pass
     except http_requests.exceptions.RequestException as e:
@@ -1324,6 +1339,7 @@ def chat_message_webhook():
             # Forward to n8n webhook
             n8n_payload = {
                 "entry_id": entry.id,
+                "callback_base": n8n_callback_base(),
                 "message": user_message,
                 "user_id": db_user.id,
                 "catalog_context": {
@@ -1457,6 +1473,7 @@ def regenerate_entry(entry_id):
                 "entry_id": entry.id,
                 "raw_input": entry.raw_input,
                 "input_type": entry.input_type,
+                "callback_base": n8n_callback_base(),
             }, timeout=5.0)
         except http_requests.exceptions.RequestException as e:
             print(f"Regenerate webhook error: {e}")
